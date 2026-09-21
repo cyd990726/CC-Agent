@@ -1,0 +1,8 @@
+[project]
+name = "mini-agent-runtime"
+version = "0.1.0"
+description = "A minimal educational coding-agent runtime"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 88
