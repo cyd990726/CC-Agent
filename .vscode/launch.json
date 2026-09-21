@@ -1,0 +1,42 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Mini Agent: 交互模式",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "--workspace",
+        "${workspaceFolder}/workspace/test_project"
+      ],
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Mini Agent: 跟踪单条消息",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "--workspace",
+        "${workspaceFolder}/workspace/test_project",
+        "${input:agentTask}"
+      ],
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ],
+  "inputs": [
+    {
+      "id": "agentTask",
+      "type": "promptString",
+      "description": "输入本次要跟踪的消息",
+      "default": "分析当前工作区的文件结构，不要修改文件"
+    }
+  ]
+}

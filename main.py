@@ -2,12 +2,14 @@
 
 import argparse
 import os
-import sys
 from pathlib import Path
 
-from agent.runtime import AgentRuntime, AgentRuntimeError
-from model.llm import ChatCompletionsLLM, ModelError
+from rich.console import Console
+
+from agent.runtime import AgentRuntime
+from model.llm import ChatCompletionsLLM
 from tools import ReadFileTool, SearchTool, ShellTool, ToolExecutor, WriteFileTool
+from ui import SessionPermissionHandler, TerminalApp, TerminalRenderer
 
 
 # 加载环境变量
@@ -51,6 +53,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--request-timeout", type=float, default=60.0)
+    parser.add_argument(
+        "--no-confirm",
+        action="store_true",
+        help="allow write_file and shell without confirmation",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show complete tool output",
+    )
     return parser
 
 
@@ -61,23 +73,23 @@ def main(argv: list[str] | None = None) -> int:
     if not args.model:
         parser.error("--model or MINI_AGENT_MODEL is required")
 
-    task = " ".join(args.task).strip()
-    if not task:
-        try:
-            task = input("Task: ").strip()
-        except EOFError:
-            task = ""
-    if not task:
-        parser.error("task cannot be empty")
-
     workspace = Path(args.workspace).expanduser().resolve()
+    console = Console()
+    permission_handler = None
+    if not args.no_confirm:
+        permission_handler = SessionPermissionHandler(console)
+    else:
+        console.print(
+            "[bold yellow]警告：权限确认已关闭，Agent 可以直接写文件和执行命令。[/]"
+        )
     executor = ToolExecutor(
         [
             ReadFileTool(workspace),
             WriteFileTool(workspace),
             SearchTool(workspace),
             ShellTool(workspace),
-        ]
+        ],
+        permission_handler=permission_handler,
     )
     model = ChatCompletionsLLM(
         model=args.model,
@@ -86,13 +98,19 @@ def main(argv: list[str] | None = None) -> int:
         timeout=args.request_timeout,
     )
     runtime = AgentRuntime(model, executor, max_steps=args.max_steps)
-    try:
-        state = runtime.run(task)
-    except (AgentRuntimeError, ModelError, OSError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    print(state.final_answer)
-    return 0
+    renderer = TerminalRenderer(console, verbose=args.verbose)
+    app = TerminalApp(
+        runtime,
+        renderer,
+        console,
+        model_name=args.model,
+        workspace=workspace,
+    )
+
+    task = " ".join(args.task).strip()
+    if task:
+        return 0 if app.run_task(task) else 1
+    return app.run()
 
 
 if __name__ == "__main__":

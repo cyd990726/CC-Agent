@@ -1,9 +1,11 @@
 import json
 import tempfile
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
-from tools.base import ToolExecutor
+from tools.base import Tool, ToolExecutor
 from tools.file import ReadFileTool, WriteFileTool
 from tools.search import SearchTool
 from tools.shell import ShellTool
@@ -55,6 +57,41 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(result["exit_code"], 3)
         self.assertEqual(result["stdout"], "hello")
         self.assertEqual(result["stderr"], "problem")
+
+    def test_permission_denial_is_a_recoverable_result(self) -> None:
+        class RecordingTool(Tool):
+            name = "sensitive"
+            description = "A sensitive test tool."
+            args_schema: Mapping[str, Any] = {}
+
+            def __init__(self) -> None:
+                self.called = False
+
+            def run(self, args: Mapping[str, Any]) -> str:
+                self.called = True
+                return "ran"
+
+        tool = RecordingTool()
+        executor = ToolExecutor(
+            [tool], permission_handler=lambda _name, _args: False
+        )
+
+        result = executor.execute("sensitive", {})
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.output, "execution denied by user")
+        self.assertFalse(tool.called)
+
+    def test_permission_interrupt_is_not_swallowed(self) -> None:
+        def interrupt(_name: str, _args: Mapping[str, Any]) -> bool:
+            raise KeyboardInterrupt
+
+        executor = ToolExecutor(
+            [ReadFileTool(self.workspace)], permission_handler=interrupt
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            executor.execute("read_file", {"path": "anything.txt"})
 
 
 if __name__ == "__main__":

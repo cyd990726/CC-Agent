@@ -1,9 +1,10 @@
 """The minimal model -> action -> observation agent loop."""
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
+from agent.events import AgentEvent, EventType
 from agent.prompt import build_system_prompt
 from agent.state import AgentState
 from model.llm import LLM
@@ -40,7 +41,12 @@ class AgentRuntime:
         self.tools = tools
         self.max_steps = max_steps
 
-    def run(self, task: str) -> AgentState:
+    def run(
+        self,
+        task: str,
+        *,
+        on_event: Callable[[AgentEvent], None] | None = None,
+    ) -> AgentState:
         task = task.strip()
         if not task:
             raise ValueError("task cannot be empty")
@@ -48,37 +54,95 @@ class AgentRuntime:
         state = AgentState(current_task=task)
         state.add_message("system", build_system_prompt(self.tools.describe()))
         state.add_message("user", task)
+        self._emit(on_event, EventType.RUN_STARTED, task=task)
 
-        for _ in range(self.max_steps):
-            response = self.model.chat(state.messages)
-            state.steps += 1
-            self._record_model_response(state, response)
-
-            has_action = "action" in response and response["action"] is not None
-            has_answer = "final_answer" in response
-            if has_action == has_answer:
-                raise AgentRuntimeError(
-                    "model response must contain exactly one of action or final_answer"
+        try:
+            for _ in range(self.max_steps):
+                self._emit(
+                    on_event,
+                    EventType.MODEL_STARTED,
+                    step=state.steps + 1,
+                )
+                response = self.model.chat(state.messages)
+                state.steps += 1
+                self._record_model_response(state, response)
+                self._emit(
+                    on_event,
+                    EventType.MODEL_COMPLETED,
+                    step=state.steps,
+                    response=dict(response),
                 )
 
-            if has_answer:
-                answer = response["final_answer"]
-                if not isinstance(answer, str) or not answer.strip():
-                    raise AgentRuntimeError("final_answer must be a non-empty string")
-                state.finished = True
-                state.final_answer = answer.strip()
-                return state
+                has_action = "action" in response and response["action"] is not None
+                has_answer = "final_answer" in response
+                if has_action == has_answer:
+                    raise AgentRuntimeError(
+                        "model response must contain exactly one of "
+                        "action or final_answer"
+                    )
 
-            tool_name, args = self._parse_action(response["action"])
-            result = self.tools.execute(tool_name, args)
-            state.tool_results.append(result)
-            state.add_message(
-                "user",
-                "Observation:\n"
-                + json.dumps(result.as_dict(), ensure_ascii=False, sort_keys=True),
+                if has_answer:
+                    answer = response["final_answer"]
+                    if not isinstance(answer, str) or not answer.strip():
+                        raise AgentRuntimeError(
+                            "final_answer must be a non-empty string"
+                        )
+                    state.finished = True
+                    state.final_answer = answer.strip()
+                    self._emit(
+                        on_event,
+                        EventType.RUN_COMPLETED,
+                        answer=state.final_answer,
+                        steps=state.steps,
+                    )
+                    return state
+
+                tool_name, args = self._parse_action(response["action"])
+                event_args = dict(args)
+                self._emit(
+                    on_event,
+                    EventType.TOOL_REQUESTED,
+                    tool=tool_name,
+                    args=event_args,
+                )
+                self._emit(
+                    on_event,
+                    EventType.TOOL_STARTED,
+                    tool=tool_name,
+                    args=event_args,
+                )
+                result = self.tools.execute(tool_name, args)
+                state.tool_results.append(result)
+                self._emit(
+                    on_event,
+                    EventType.TOOL_COMPLETED,
+                    result=result.as_dict(),
+                )
+                state.add_message(
+                    "user",
+                    "Observation:\n"
+                    + json.dumps(
+                        result.as_dict(), ensure_ascii=False, sort_keys=True
+                    ),
+                )
+
+            raise MaxStepsExceeded(state)
+        except Exception as exc:
+            self._emit(
+                on_event,
+                EventType.RUN_FAILED,
+                error=f"{type(exc).__name__}: {exc}",
             )
+            raise
 
-        raise MaxStepsExceeded(state)
+    @staticmethod
+    def _emit(
+        handler: Callable[[AgentEvent], None] | None,
+        event_type: EventType,
+        **data: Any,
+    ) -> None:
+        if handler is not None:
+            handler(AgentEvent(event_type, data))
 
     @staticmethod
     def _record_model_response(

@@ -3,6 +3,7 @@ import unittest
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from agent.events import AgentEvent, EventType
 from agent.runtime import AgentRuntime, MaxStepsExceeded
 from model.llm import LLM
 from tools.base import Tool, ToolExecutor
@@ -69,6 +70,48 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.state.steps, 1)
         self.assertFalse(caught.exception.state.finished)
+
+    def test_emits_events_for_complete_tool_cycle(self) -> None:
+        model = QueueLLM(
+            [
+                {"action": {"tool": "echo", "args": {"text": "hello"}}},
+                {"final_answer": "done"},
+            ]
+        )
+        events: list[AgentEvent] = []
+
+        AgentRuntime(model, ToolExecutor([EchoTool()])).run(
+            "test task", on_event=events.append
+        )
+
+        self.assertEqual(
+            [event.type for event in events],
+            [
+                EventType.RUN_STARTED,
+                EventType.MODEL_STARTED,
+                EventType.MODEL_COMPLETED,
+                EventType.TOOL_REQUESTED,
+                EventType.TOOL_STARTED,
+                EventType.TOOL_COMPLETED,
+                EventType.MODEL_STARTED,
+                EventType.MODEL_COMPLETED,
+                EventType.RUN_COMPLETED,
+            ],
+        )
+        self.assertEqual(events[-1].data["answer"], "done")
+
+    def test_emits_failure_event_when_step_limit_is_exceeded(self) -> None:
+        events: list[AgentEvent] = []
+        runtime = AgentRuntime(
+            QueueLLM([{"action": {"tool": "echo", "args": {"text": "x"}}}]),
+            ToolExecutor([EchoTool()]),
+            max_steps=1,
+        )
+
+        with self.assertRaises(MaxStepsExceeded):
+            runtime.run("test task", on_event=events.append)
+
+        self.assertEqual(events[-1].type, EventType.RUN_FAILED)
 
 
 if __name__ == "__main__":

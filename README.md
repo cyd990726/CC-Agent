@@ -10,8 +10,16 @@
 
 ## 运行
 
-只需 Python 3.10+，没有第三方依赖。程序会自动读取项目根目录的 `.env`，
-也可以使用当前 Shell 中的环境变量（Shell 环境变量优先）：
+需要 Python 3.10+。先安装项目依赖：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+```
+
+程序会自动读取项目根目录的 `.env`，也可以使用当前 Shell 中的环境变量
+（Shell 环境变量优先）：
 
 ```bash
 export MINI_AGENT_MODEL="your-model"
@@ -21,6 +29,16 @@ export MINI_AGENT_BASE_URL="https://provider.example/v1"
 
 python main.py --workspace ./workspace/test_project "创建 hello.py 并运行它"
 ```
+
+不传任务时进入持续交互界面：
+
+```bash
+python3 main.py --workspace ./workspace/test_project
+```
+
+交互界面支持 `/help`、`/clear`、`/status`、`/history`、`/verbose` 和
+`/exit`。`write_file` 与 `shell` 默认会在执行前请求确认；可以使用
+`--no-confirm` 跳过确认，但只应在可信、隔离的工作目录中使用。
 
 模型通过严格 JSON 协议选择工具或结束任务。文件工具被限制在 `--workspace`
 目录内；Shell 命令在该目录中运行。Phase 1 尚未提供完整沙箱，因而只应在可信、

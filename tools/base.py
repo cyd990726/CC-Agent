@@ -1,7 +1,7 @@
 """Tool contract and dispatcher."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -48,8 +48,14 @@ class ToolResult:
 class ToolExecutor:
     """Register tools by name and turn failures into model observations."""
 
-    def __init__(self, tools: Sequence[Tool]) -> None:
+    def __init__(
+        self,
+        tools: Sequence[Tool],
+        *,
+        permission_handler: Callable[[str, Mapping[str, Any]], bool] | None = None,
+    ) -> None:
         self._tools: dict[str, Tool] = {}
+        self._permission_handler = permission_handler
         for tool in tools:
             if not tool.name:
                 raise ValueError("tool name cannot be empty")
@@ -70,6 +76,18 @@ class ToolExecutor:
                 success=False,
                 output=f"unknown tool {tool_name!r}; available tools: {available}",
             )
+        if self._permission_handler is not None:
+            try:
+                allowed = self._permission_handler(tool_name, args)
+            except EOFError:
+                allowed = False
+            if not allowed:
+                return ToolResult(
+                    tool_name,
+                    dict(args),
+                    False,
+                    "execution denied by user",
+                )
         try:
             output = tool.run(args)
             return ToolResult(tool_name, dict(args), True, str(output))
