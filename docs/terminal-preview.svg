@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="680" viewBox="0 0 1100 680" role="img" aria-labelledby="title desc">
+  <title id="title">Mini Agent terminal interface</title>
+  <desc id="desc">A dark terminal showing Mini Agent editing a Python project, its command menu, current model, and workspace.</desc>
+  <rect width="1100" height="680" rx="18" fill="#09090b"/>
+  <rect x="1" y="1" width="1098" height="678" rx="17" fill="none" stroke="#3f3f46" stroke-width="2"/>
+  <circle cx="30" cy="28" r="7" fill="#ef4444"/>
+  <circle cx="54" cy="28" r="7" fill="#eab308"/>
+  <circle cx="78" cy="28" r="7" fill="#22c55e"/>
+  <text x="550" y="34" fill="#71717a" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15">mini-agent</text>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18">
+    <text x="32" y="82" fill="#22d3ee" font-weight="700">✦ Mini Agent</text>
+    <text x="32" y="116" fill="#a1a1aa">Interactive coding agent · /help for commands</text>
+    <text x="32" y="170" fill="#22d3ee">●</text>
+    <text x="58" y="170" fill="#f4f4f5" font-weight="700">Read</text>
+    <text x="112" y="170" fill="#d4d4d8">src/app.py</text>
+    <text x="58" y="202" fill="#71717a">└ Read 86 lines · 2.4 KB</text>
+    <text x="32" y="246" fill="#22d3ee">●</text>
+    <text x="58" y="246" fill="#f4f4f5" font-weight="700">Edit</text>
+    <text x="112" y="246" fill="#d4d4d8">src/app.py</text>
+    <text x="58" y="278" fill="#22c55e">└ Updated src/app.py · 42ms</text>
+    <text x="32" y="322" fill="#22d3ee">✦ Mini Agent</text>
+    <text x="32" y="354" fill="#e4e4e7">Implemented the requested change and verified the tests.</text>
+    <text x="32" y="386" fill="#71717a">✓ Done in 3.2s · 4 steps</text>
+    <rect x="28" y="424" width="1044" height="70" rx="10" fill="#0f0f12" stroke="#52525b" stroke-width="2"/>
+    <text x="46" y="467" fill="#22d3ee" font-weight="700">›</text>
+    <text x="72" y="467" fill="#f4f4f5">/</text>
+    <rect x="28" y="506" width="520" height="104" rx="10" fill="#111827" stroke="#52525b"/>
+    <text x="46" y="536" fill="#71717a">Commands</text>
+    <rect x="38" y="548" width="500" height="30" rx="5" fill="#164e63"/>
+    <text x="50" y="570" fill="#ecfeff" font-weight="700">› /help</text>
+    <text x="180" y="570" fill="#ecfeff">查看命令</text>
+    <text x="50" y="600" fill="#d4d4d8">  /status</text>
+    <text x="180" y="600" fill="#a1a1aa">查看当前配置</text>
+    <text x="40" y="650" fill="#22d3ee" font-weight="700">kimi-k2.5</text>
+    <text x="170" y="650" fill="#52525b">·</text>
+    <text x="192" y="650" fill="#a78bfa">~/projects/my-app</text>
+  </g>
+</svg>

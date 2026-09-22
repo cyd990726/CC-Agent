@@ -4,6 +4,8 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from prompt_toolkit.document import Document
+from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from agent.events import AgentEvent, EventType
@@ -112,6 +114,30 @@ class PermissionHandlerTests(unittest.TestCase):
         )
 
         self.assertFalse(handler("write_file", {"path": "a.py", "content": "x"}))
+
+    def test_permission_card_shows_requested_operation(self) -> None:
+        handler = SessionPermissionHandler(
+            self.console,
+            ask=lambda _prompt: "",
+        )
+
+        self.assertFalse(handler("shell", {"command": "python -m unittest"}))
+        rendered = self.output.getvalue()
+        self.assertIn("权限确认", rendered)
+        self.assertIn("执行命令", rendered)
+        self.assertIn("python -m unittest", rendered)
+
+    def test_permission_selector_supports_arrow_keys(self) -> None:
+        handler = SessionPermissionHandler(self.console)
+        with create_pipe_input() as pipe_input:
+            pipe_input.send_text("\x1b[C\r")
+
+            answer = handler._select_permission(
+                input=pipe_input,
+                output=DummyOutput(),
+            )
+
+        self.assertEqual(answer, "y")
 
     def test_edit_file_requires_permission(self) -> None:
         prompts: list[str] = []

@@ -1,16 +1,36 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mini-agent-runtime"
 version = "0.1.0"
 description = "A minimal educational coding-agent runtime"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "chenyandong" }]
 requires-python = ">=3.10"
+keywords = ["agent", "coding-agent", "llm", "terminal"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development",
+]
 dependencies = [
     "prompt-toolkit>=3.0,<4.0",
     "rich>=13.0,<15.0",
 ]
+
+[project.scripts]
+mini-agent = "main:main"
+
+[project.urls]
+Homepage = "https://github.com/cyd990726/CC-Agent"
+Issues = "https://github.com/cyd990726/CC-Agent/issues"
+Source = "https://github.com/cyd990726/CC-Agent"
 
 [tool.setuptools]
 py-modules = ["main"]

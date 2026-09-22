@@ -2,10 +2,13 @@
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 from rich.console import Console
 
+from agent.config import run_init, user_config_path
+from agent.diagnostics import run_doctor
 from agent.runtime import AgentRuntime
 from model.llm import ChatCompletionsLLM
 from tools import (
@@ -22,6 +25,9 @@ from tools import (
     create_search_provider,
 )
 from ui import SessionPermissionHandler, TerminalApp, TerminalRenderer
+
+
+VERSION = "0.1.0"
 
 
 # 加载环境变量
@@ -63,7 +69,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("MINI_AGENT_BASE_URL", "https://api.openai.com/v1"),
         help="OpenAI-compatible API base URL",
     )
-    parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=os.environ.get("MINI_AGENT_MAX_STEPS", "20"),
+        help="maximum agent steps (default: 20 or MINI_AGENT_MAX_STEPS)",
+    )
     parser.add_argument("--request-timeout", type=float, default=60.0)
     parser.add_argument(
         "--max-rpm",
@@ -87,15 +98,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="show complete tool output",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_env_file(Path(__file__).resolve().parent / ".env")
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "init":
+        return _run_init_command(arguments[1:])
+
+    loaded_configs = load_configuration()
+    if arguments and arguments[0] == "doctor":
+        return _run_doctor_command(arguments[1:], loaded_configs)
+
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
     if not args.model:
-        parser.error("--model or MINI_AGENT_MODEL is required")
+        parser.error(
+            "--model or MINI_AGENT_MODEL is required; "
+            "run `mini-agent init` to configure it"
+        )
 
     workspace = Path(args.workspace).expanduser().resolve()
     console = Console()
@@ -142,6 +164,67 @@ def main(argv: list[str] | None = None) -> int:
     if task:
         return 0 if app.run_task(task) else 1
     return app.run()
+
+
+def load_configuration(*, cwd: Path | None = None) -> list[Path]:
+    """Load project then user configuration, preserving shell precedence."""
+
+    loaded: list[Path] = []
+    local_path = (cwd or Path.cwd()) / ".env"
+    user_path = user_config_path()
+    for path in (local_path, user_path):
+        if path in loaded or not path.is_file():
+            continue
+        load_env_file(path)
+        loaded.append(path)
+    return loaded
+
+
+def _run_init_command(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="mini-agent init",
+        description="Configure a model provider for Mini Agent",
+    )
+    parser.add_argument("--force", action="store_true", help="overwrite config")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="custom config path (default: user config directory)",
+    )
+    args = parser.parse_args(argv)
+    console = Console()
+    try:
+        return run_init(console, path=args.config, force=args.force)
+    except (EOFError, KeyboardInterrupt):
+        console.print("\n[yellow]初始化已取消。[/]")
+        return 130
+
+
+def _run_doctor_command(argv: list[str], loaded_configs: list[Path]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="mini-agent doctor",
+        description="Check Mini Agent configuration and runtime dependencies",
+    )
+    parser.add_argument("--workspace", default=".")
+    parser.add_argument(
+        "--connectivity",
+        action="store_true",
+        help="also call the provider's /models endpoint",
+    )
+    args = parser.parse_args(argv)
+    console = Console()
+    if loaded_configs:
+        console.print(
+            "[bright_black]Loaded config: "
+            + ", ".join(str(path) for path in loaded_configs)
+            + "[/]"
+        )
+    return run_doctor(
+        console,
+        Path(args.workspace).expanduser().resolve(),
+        connectivity=args.connectivity,
+    )
 
 
 if __name__ == "__main__":
