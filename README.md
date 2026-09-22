@@ -45,6 +45,8 @@ python3 main.py --workspace ./workspace/test_project
 
 交互界面支持 `/help`、`/clear`、`/status`、`/history`、`/verbose` 和
 `/exit`。输入 `/` 会显示命令菜单，可使用 `Tab` / `Shift+Tab` 选择命令。
+输入框下方会持续显示当前模型和工作目录。
+长输入会自动折行并增高输入框；使用 `Alt+Enter` 或 `Ctrl+J` 可以主动换行。
 `edit_file`、`write_file`、`shell`、`web_search` 与 `fetch_url` 默认会在执行前
 请求确认；可以使用 `--no-confirm` 跳过确认，但只应在可信、隔离的工作目录中使用。
 

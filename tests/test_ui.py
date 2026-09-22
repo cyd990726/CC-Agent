@@ -1,13 +1,16 @@
 import unittest
 from io import StringIO
+from pathlib import Path
+from unittest.mock import Mock
 
 from prompt_toolkit.document import Document
 from rich.console import Console
 
 from agent.events import AgentEvent, EventType
+from agent.runtime import AgentRuntime
 from ui.permissions import SessionPermissionHandler
 from ui.renderer import TerminalRenderer
-from ui.terminal import COMMANDS, SlashCommandCompleter
+from ui.terminal import COMMANDS, SlashCommandCompleter, TerminalApp
 
 
 class SlashCommandCompleterTests(unittest.TestCase):
@@ -36,6 +39,44 @@ class SlashCommandCompleterTests(unittest.TestCase):
         )
 
         self.assertEqual(completions, [])
+
+
+class TerminalAppTests(unittest.TestCase):
+    def test_status_line_contains_model_and_workspace(self) -> None:
+        output = StringIO()
+        console = Console(file=output, force_terminal=False)
+        app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=Path("/tmp/example"),
+            prompt=lambda _message: "/exit",
+        )
+
+        fragments = app._status_fragments()
+        rendered = "".join(text for _style, text in fragments)
+
+        self.assertIn("test-model", rendered)
+        self.assertIn("/tmp/example", rendered)
+        model_style = next(style for style, text in fragments if text == "test-model")
+        path_style = next(style for style, text in fragments if text == "/tmp/example")
+        self.assertNotEqual(model_style, path_style)
+
+    def test_input_height_counts_wrapped_and_explicit_lines(self) -> None:
+        measure = TerminalApp._measure_input_height
+
+        self.assertEqual(measure("short", 10, 24), 1)
+        self.assertEqual(measure("1234567", 10, 24), 2)
+        self.assertEqual(measure("one\ntwo", 10, 24), 2)
+        self.assertEqual(measure("中文中文", 10, 24), 2)
+
+    def test_completion_panel_padding_uses_display_width(self) -> None:
+        padded = TerminalApp._fit_cells("/help 查看命令", 20)
+
+        from prompt_toolkit.utils import get_cwidth
+
+        self.assertEqual(get_cwidth(padded), 20)
 
 
 class PermissionHandlerTests(unittest.TestCase):
