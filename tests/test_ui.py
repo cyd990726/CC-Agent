@@ -72,6 +72,21 @@ class PermissionHandlerTests(unittest.TestCase):
 
         self.assertFalse(handler("write_file", {"path": "a.py", "content": "x"}))
 
+    def test_edit_file_requires_permission(self) -> None:
+        prompts: list[str] = []
+        handler = SessionPermissionHandler(
+            self.console,
+            ask=lambda prompt: prompts.append(prompt) or "n",
+        )
+
+        allowed = handler(
+            "edit_file",
+            {"path": "a.py", "old_text": "before", "new_text": "after"},
+        )
+
+        self.assertFalse(allowed)
+        self.assertEqual(len(prompts), 1)
+
 
 class RendererTests(unittest.TestCase):
     def test_toggle_verbose(self) -> None:

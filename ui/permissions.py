@@ -17,7 +17,9 @@ class SessionPermissionHandler:
         self,
         console: Console,
         *,
-        protected_tools: frozenset[str] = frozenset({"write_file", "shell"}),
+        protected_tools: frozenset[str] = frozenset(
+            {"edit_file", "write_file", "shell"}
+        ),
         ask: Callable[[str], str] | None = None,
     ) -> None:
         self.console = console
@@ -46,10 +48,14 @@ class SessionPermissionHandler:
 
     def _render_request(self, tool_name: str, args: Mapping[str, Any]) -> None:
         body = Text()
-        labels = {"write_file": "Write file", "shell": "Run command"}
+        labels = {
+            "edit_file": "Edit file",
+            "write_file": "Write file",
+            "shell": "Run command",
+        }
         body.append(labels.get(tool_name, tool_name), style="bold")
         for name, value in args.items():
-            if name == "content" and isinstance(value, str):
+            if name in {"content", "old_text", "new_text"} and isinstance(value, str):
                 rendered = f"{len(value):,} characters"
             else:
                 rendered = str(value)

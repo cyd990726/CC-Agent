@@ -89,7 +89,10 @@ class TerminalRenderer:
 
     TOOL_LABELS = {
         "read_file": "Read",
+        "edit_file": "Edit",
         "write_file": "Write",
+        "find_files": "Find",
+        "list_files": "List",
         "search": "Search",
         "shell": "Bash",
     }
@@ -232,13 +235,30 @@ class TerminalRenderer:
     def _tool_description(
         self, tool: str, args: Mapping[str, Any]
     ) -> tuple[str, list[str]]:
-        if tool in {"read_file", "write_file"}:
+        if tool in {"read_file", "edit_file", "write_file"}:
             path = str(args.get("path", ""))
             details: list[str] = []
             content = args.get("content")
             if tool == "write_file" and isinstance(content, str):
                 details.append(f"{len(content):,} characters")
+            if tool == "read_file" and ("offset" in args or "limit" in args):
+                offset = args.get("offset", 1)
+                limit = args.get("limit")
+                if isinstance(limit, int):
+                    details.append(f"lines {offset}-{offset + limit - 1}")
+                else:
+                    details.append(f"from line {offset}")
+            if tool == "edit_file":
+                old_text = str(args.get("old_text", ""))
+                new_text = str(args.get("new_text", ""))
+                details.append(f"{len(old_text):,} → {len(new_text):,} characters")
             return path, details
+        if tool == "find_files":
+            pattern = str(args.get("pattern", ""))
+            return pattern, [f"in {args.get('path', '.')}"]
+        if tool == "list_files":
+            path = str(args.get("path", "."))
+            return path, [f"depth {args.get('depth', 1)}"]
         if tool == "search":
             query = self._one_line(str(args.get("query", "")), 72)
             scope = str(args.get("path", "."))
@@ -281,12 +301,33 @@ class TerminalRenderer:
         if not success:
             return "Failed", self._preview_lines(output)
         if tool == "read_file":
+            range_match = re.match(r"^\[lines (\d+)-(\d+) of (\d+)\]", output)
+            if range_match:
+                start, end, total = range_match.groups()
+                details = self._preview_lines(output) if self.verbose else []
+                return f"Read lines {start}-{end} of {total}", details
+            if output == "[file is empty: 0 lines]":
+                return "File is empty", []
             line_count = len(output.splitlines())
             size = len(output.encode("utf-8"))
             details = self._preview_lines(output) if self.verbose else []
             return f"Read {line_count:,} lines · {self._format_bytes(size)}", details
         if tool == "write_file":
             return output or "File written", []
+        if tool == "edit_file":
+            lines = output.splitlines()
+            summary = lines[0].removeprefix("updated ") if lines else "file"
+            return f"Updated {summary}", self._preview_lines("\n".join(lines[1:]))
+        if tool == "find_files":
+            if output == "no files":
+                return "No files", []
+            lines = output.splitlines()
+            return f"Found {len(lines):,} files", self._preview_lines(output)
+        if tool == "list_files":
+            if output == "empty directory":
+                return "Empty directory", []
+            lines = output.splitlines()
+            return f"Listed {len(lines):,} entries", self._preview_lines(output)
         if tool == "search":
             if output == "no matches":
                 return "No matches", []

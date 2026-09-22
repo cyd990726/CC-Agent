@@ -8,7 +8,16 @@ from rich.console import Console
 
 from agent.runtime import AgentRuntime
 from model.llm import ChatCompletionsLLM
-from tools import ReadFileTool, SearchTool, ShellTool, ToolExecutor, WriteFileTool
+from tools import (
+    EditFileTool,
+    FindFilesTool,
+    ListFilesTool,
+    ReadFileTool,
+    SearchTool,
+    ShellTool,
+    ToolExecutor,
+    WriteFileTool,
+)
 from ui import SessionPermissionHandler, TerminalApp, TerminalRenderer
 
 
@@ -62,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-confirm",
         action="store_true",
-        help="allow write_file and shell without confirmation",
+        help="allow edit_file, write_file, and shell without confirmation",
     )
     parser.add_argument(
         "--verbose",
@@ -86,12 +95,16 @@ def main(argv: list[str] | None = None) -> int:
         permission_handler = SessionPermissionHandler(console)
     else:
         console.print(
-            "[bold yellow]警告：权限确认已关闭，Agent 可以直接写文件和执行命令。[/]"
+            "[bold yellow]警告：权限确认已关闭，Agent 可以直接写文件"
+            "和执行命令。[/]"
         )
     executor = ToolExecutor(
         [
             ReadFileTool(workspace),
+            EditFileTool(workspace),
             WriteFileTool(workspace),
+            FindFilesTool(workspace),
+            ListFilesTool(workspace),
             SearchTool(workspace),
             ShellTool(workspace),
         ],

@@ -5,7 +5,7 @@
 - 与具体厂商解耦的 `LLM` 接口，以及 OpenAI-compatible HTTP 适配器
 - `模型 -> Action -> Tool -> Observation` Agent Loop
 - 进程内任务状态
-- 读取/写入文件、文本搜索、Shell 命令四个工具
+- 分段读取、精确编辑、写入、查找和列出文件、文本搜索、Shell 命令
 - 最大执行步数、结构化协议校验和可恢复的工具错误
 - 基于 SSE 的模型响应流式接收与终端答案增量输出
 
@@ -41,7 +41,7 @@ python3 main.py --workspace ./workspace/test_project
 
 交互界面支持 `/help`、`/clear`、`/status`、`/history`、`/verbose` 和
 `/exit`。输入 `/` 会显示命令菜单，可使用 `Tab` / `Shift+Tab` 选择命令。
-`write_file` 与 `shell` 默认会在执行前请求确认；可以使用
+`edit_file`、`write_file` 与 `shell` 默认会在执行前请求确认；可以使用
 `--no-confirm` 跳过确认，但只应在可信、隔离的工作目录中使用。
 
 模型通过严格 JSON 协议选择工具或结束任务。文件工具被限制在 `--workspace`
