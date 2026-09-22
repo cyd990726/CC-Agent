@@ -40,7 +40,8 @@ python3 main.py --workspace ./workspace/test_project
 ```
 
 交互界面支持 `/help`、`/clear`、`/status`、`/history`、`/verbose` 和
-`/exit`。`write_file` 与 `shell` 默认会在执行前请求确认；可以使用
+`/exit`。输入 `/` 会显示命令菜单，可使用 `Tab` / `Shift+Tab` 选择命令。
+`write_file` 与 `shell` 默认会在执行前请求确认；可以使用
 `--no-confirm` 跳过确认，但只应在可信、隔离的工作目录中使用。
 
 模型通过严格 JSON 协议选择工具或结束任务。文件工具被限制在 `--workspace`

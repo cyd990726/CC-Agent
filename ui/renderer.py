@@ -1,16 +1,22 @@
-"""Render agent events as a compact terminal transcript."""
+"""Render agent events as a polished, compact terminal transcript."""
 
 import json
 import re
+import time
 from collections.abc import Mapping
 from typing import Any
 
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.status import Status
 from rich.text import Text
 
 from agent.events import AgentEvent, EventType
+
+
+ACCENT = "bright_cyan"
+MUTED = "bright_black"
 
 
 class _JsonStringFieldStreamer:
@@ -79,7 +85,14 @@ class _JsonStringFieldStreamer:
 
 
 class TerminalRenderer:
-    """Translate runtime events into human-readable terminal output."""
+    """Translate runtime events into a readable terminal conversation."""
+
+    TOOL_LABELS = {
+        "read_file": "Read",
+        "write_file": "Write",
+        "search": "Search",
+        "shell": "Bash",
+    }
 
     def __init__(
         self,
@@ -87,36 +100,33 @@ class TerminalRenderer:
         *,
         verbose: bool = False,
         output_limit: int = 1200,
+        output_lines: int = 10,
     ) -> None:
         self.console = console
         self.verbose = verbose
         self.output_limit = output_limit
+        self.output_lines = output_lines
         self._status: Status | None = None
+        self._live_answer: Live | None = None
         self._answer_stream = _JsonStringFieldStreamer("final_answer")
+        self._answer_text = ""
         self._streamed_answer = False
+        self._run_started_at: float | None = None
+        self._tool_started_at: float | None = None
 
     def __call__(self, event: AgentEvent) -> None:
         if event.type is EventType.RUN_STARTED:
+            self._run_started_at = time.monotonic()
             return
         if event.type is EventType.MODEL_STARTED:
             self._answer_stream = _JsonStringFieldStreamer("final_answer")
+            self._answer_text = ""
             self._streamed_answer = False
-            self._start_status("Agent 正在思考...")
+            step = event.data.get("step", 1)
+            self._start_status(f"Thinking · step {step}")
             return
         if event.type is EventType.MODEL_DELTA:
-            text = self._answer_stream.feed(str(event.data.get("delta", "")))
-            if text:
-                if not self._streamed_answer:
-                    self._stop_status()
-                    self.console.print("\n[bold green]●[/] ", end="")
-                    self._streamed_answer = True
-                self.console.print(
-                    text,
-                    end="",
-                    markup=False,
-                    highlight=False,
-                    soft_wrap=True,
-                )
+            self._render_answer_delta(str(event.data.get("delta", "")))
             return
         if event.type is EventType.MODEL_COMPLETED:
             self._stop_status()
@@ -124,27 +134,24 @@ class TerminalRenderer:
             if isinstance(response, Mapping) and not self._streamed_answer:
                 thought = response.get("thought")
                 if isinstance(thought, str) and thought.strip():
-                    self.console.print(Text(f"● {thought.strip()}", style="dim"))
+                    self.console.print(Text(f"  {thought.strip()}", style=MUTED))
             return
         if event.type is EventType.TOOL_REQUESTED:
             self._render_tool_request(event.data)
+            return
+        if event.type is EventType.TOOL_STARTED:
+            self._tool_started_at = time.monotonic()
             return
         if event.type is EventType.TOOL_COMPLETED:
             self._render_tool_result(event.data)
             return
         if event.type is EventType.RUN_COMPLETED:
-            self._stop_status()
-            answer = str(event.data.get("answer", ""))
-            if self._streamed_answer:
-                self.console.print("\n[bold green]✓ 完成[/]")
-                return
-            self.console.print()
-            self.console.print("[bold green]✓ 完成[/]")
-            self.console.print(Markdown(answer))
+            self._render_completion(event.data)
             return
         if event.type is EventType.RUN_FAILED:
-            self._stop_status()
-            self.console.print(f"[bold red]✗ {event.data.get('error', '运行失败')}[/]")
+            self.close()
+            error = str(event.data.get("error", "运行失败"))
+            self.console.print(Text.assemble(("✕ ", "bold red"), (error, "red")))
 
     def toggle_verbose(self) -> bool:
         self.verbose = not self.verbose
@@ -152,10 +159,48 @@ class TerminalRenderer:
 
     def close(self) -> None:
         self._stop_status()
+        self._stop_live_answer()
+
+    def _render_answer_delta(self, delta: str) -> None:
+        text = self._answer_stream.feed(delta)
+        if not text:
+            return
+        self._answer_text += text
+        if not self._streamed_answer:
+            self._stop_status()
+            self.console.print()
+            self.console.print(f"[bold {ACCENT}]✦ Mini Agent[/]")
+            self._live_answer = Live(
+                Markdown(self._answer_text),
+                console=self.console,
+                refresh_per_second=16,
+                vertical_overflow="visible",
+            )
+            self._live_answer.start()
+            self._streamed_answer = True
+        elif self._live_answer is not None:
+            self._live_answer.update(Markdown(self._answer_text), refresh=False)
+
+    def _render_completion(self, data: Mapping[str, Any]) -> None:
+        self._stop_status()
+        if self._streamed_answer:
+            self._stop_live_answer()
+        else:
+            answer = str(data.get("answer", ""))
+            self.console.print()
+            self.console.print(f"[bold {ACCENT}]✦ Mini Agent[/]")
+            self.console.print(Markdown(answer))
+
+        elapsed = self._elapsed(self._run_started_at)
+        steps = data.get("steps", 0)
+        meta = f"Done in {elapsed} · {steps} step{'s' if steps != 1 else ''}"
+        self.console.print(Text(f"  ✓ {meta}", style=MUTED))
 
     def _start_status(self, message: str) -> None:
         self._stop_status()
-        self._status = self.console.status(message, spinner="dots")
+        self._status = self.console.status(
+            Text(message, style=MUTED), spinner="dots", spinner_style=ACCENT
+        )
         self._status.start()
 
     def _stop_status(self) -> None:
@@ -163,53 +208,152 @@ class TerminalRenderer:
             self._status.stop()
             self._status = None
 
+    def _stop_live_answer(self) -> None:
+        if self._live_answer is not None:
+            self._live_answer.stop()
+            self._live_answer = None
+
     def _render_tool_request(self, data: Mapping[str, Any]) -> None:
         tool = str(data.get("tool", "unknown"))
         args = data.get("args", {})
-        self.console.print(f"\n[bold cyan]◆ {tool}[/]")
-        if not isinstance(args, Mapping):
-            return
-        for name, value in args.items():
-            if name == "content" and isinstance(value, str) and not self.verbose:
-                rendered = f"<{len(value)} characters>"
-            else:
-                rendered = self._truncate(self._format_value(value))
-            self.console.print(Text(f"  {name}: {rendered}", style="dim"))
+        args = args if isinstance(args, Mapping) else {}
+        label = self.TOOL_LABELS.get(tool, tool)
+        title, details = self._tool_description(tool, args)
+
+        line = Text()
+        line.append("● ", style=ACCENT)
+        line.append(label, style="bold")
+        if title:
+            line.append(f" {title}")
+        self.console.print(line)
+        for detail in details:
+            self.console.print(Text(f"  └ {detail}", style=MUTED))
+
+    def _tool_description(
+        self, tool: str, args: Mapping[str, Any]
+    ) -> tuple[str, list[str]]:
+        if tool in {"read_file", "write_file"}:
+            path = str(args.get("path", ""))
+            details: list[str] = []
+            content = args.get("content")
+            if tool == "write_file" and isinstance(content, str):
+                details.append(f"{len(content):,} characters")
+            return path, details
+        if tool == "search":
+            query = self._one_line(str(args.get("query", "")), 72)
+            scope = str(args.get("path", "."))
+            glob = args.get("glob")
+            detail = f"in {scope}"
+            if glob:
+                detail += f" · {glob}"
+            return json.dumps(query, ensure_ascii=False), [detail]
+        if tool == "shell":
+            command = self._one_line(str(args.get("command", "")), 100)
+            return "", [f"$ {command}"]
+        details = [
+            f"{name}: {self._format_value(value)}" for name, value in args.items()
+        ]
+        return "", details
 
     def _render_tool_result(self, data: Mapping[str, Any]) -> None:
         result = data.get("result", {})
         if not isinstance(result, Mapping):
             return
+        tool = str(result.get("tool", ""))
         success = bool(result.get("success"))
         output = str(result.get("output", ""))
+        elapsed = self._elapsed(self._tool_started_at)
+        summary, details = self._tool_result_summary(tool, output, success)
+        marker = "└" if success else "└ ✕"
         style = "green" if success else "red"
-        marker = "✓" if success else "✗"
-        summary = self._summarize_output(str(result.get("tool", "")), output)
-        self.console.print(Text(f"  {marker} {summary}", style=style))
+        if success and tool == "shell" and not summary.startswith("Exited with code 0"):
+            marker = "└ !"
+            style = "yellow"
+        suffix = f" · {elapsed}" if elapsed != "0ms" else ""
+        self.console.print(Text(f"  {marker} {summary}{suffix}", style=style))
+        for detail in details:
+            detail_style = MUTED if success else "red"
+            self.console.print(Text(f"    │ {detail}", style=detail_style))
 
-    def _summarize_output(self, tool: str, output: str) -> str:
+    def _tool_result_summary(
+        self, tool: str, output: str, success: bool
+    ) -> tuple[str, list[str]]:
+        if not success:
+            return "Failed", self._preview_lines(output)
+        if tool == "read_file":
+            line_count = len(output.splitlines())
+            size = len(output.encode("utf-8"))
+            details = self._preview_lines(output) if self.verbose else []
+            return f"Read {line_count:,} lines · {self._format_bytes(size)}", details
+        if tool == "write_file":
+            return output or "File written", []
+        if tool == "search":
+            if output == "no matches":
+                return "No matches", []
+            lines = output.splitlines()
+            return f"Found {len(lines):,} matches", self._preview_lines(output)
         if tool == "shell":
-            try:
-                parsed = json.loads(output)
-            except (json.JSONDecodeError, TypeError):
-                pass
-            else:
-                if isinstance(parsed, dict):
-                    exit_code = parsed.get("exit_code")
-                    stdout = str(parsed.get("stdout", "")).strip()
-                    stderr = str(parsed.get("stderr", "")).strip()
-                    details = "\n".join(part for part in (stdout, stderr) if part)
-                    prefix = f"exit code: {exit_code}"
-                    if details:
-                        return self._truncate(f"{prefix}\n{details}")
-                    return prefix
-        return self._truncate(output or "完成")
+            return self._shell_summary(output)
+        return "Done", self._preview_lines(output) if output else []
+
+    def _shell_summary(self, output: str) -> tuple[str, list[str]]:
+        try:
+            parsed = json.loads(output)
+        except (json.JSONDecodeError, TypeError):
+            return "Completed", self._preview_lines(output)
+        if not isinstance(parsed, dict):
+            return "Completed", self._preview_lines(output)
+        exit_code = parsed.get("exit_code")
+        stdout = str(parsed.get("stdout", "")).strip()
+        stderr = str(parsed.get("stderr", "")).strip()
+        details = "\n".join(part for part in (stdout, stderr) if part)
+        return f"Exited with code {exit_code}", self._preview_lines(details)
+
+    def _preview_lines(self, value: str) -> list[str]:
+        if not value:
+            return []
+        original = value.splitlines()
+        if self.verbose:
+            return original
+        character_clipped = len(value) > self.output_limit
+        clipped = self._truncate(value).splitlines()
+        visible = clipped[: self.output_lines]
+        omitted_lines = max(0, len(original) - len(visible))
+        if omitted_lines:
+            noun = "line" if omitted_lines == 1 else "lines"
+            visible.append(f"… {omitted_lines:,} more {noun} · /verbose to expand")
+        elif character_clipped:
+            visible.append("… output truncated · /verbose to expand")
+        return visible
 
     def _truncate(self, value: str) -> str:
         if self.verbose or len(value) <= self.output_limit:
             return value
-        omitted = len(value) - self.output_limit
-        return f"{value[:self.output_limit]}\n… 已省略 {omitted} 个字符（/verbose 查看完整输出）"
+        return value[: self.output_limit].rstrip()
+
+    @staticmethod
+    def _one_line(value: str, limit: int) -> str:
+        value = " ".join(value.split())
+        return value if len(value) <= limit else value[: limit - 1] + "…"
+
+    @staticmethod
+    def _format_bytes(size: int) -> str:
+        if size < 1024:
+            return f"{size} B"
+        if size < 1024 * 1024:
+            return f"{size / 1024:.1f} KB"
+        return f"{size / (1024 * 1024):.1f} MB"
+
+    @staticmethod
+    def _elapsed(started_at: float | None) -> str:
+        if started_at is None:
+            return "0ms"
+        seconds = max(0.0, time.monotonic() - started_at)
+        if seconds < 1:
+            return f"{seconds * 1000:.0f}ms"
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        return f"{int(seconds // 60)}m {int(seconds % 60)}s"
 
     @staticmethod
     def _format_value(value: Any) -> str:
