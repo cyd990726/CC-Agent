@@ -19,6 +19,15 @@ class QueueLLM(LLM):
         return next(self.responses)
 
 
+class StreamingQueueLLM(QueueLLM):
+    def stream_chat(self, messages, on_delta=None):
+        response = self.chat(messages)
+        if on_delta is not None:
+            on_delta('{"final_answer":"')
+            on_delta(str(response["final_answer"]) + '"}')
+        return response
+
+
 class EchoTool(Tool):
     name = "echo"
     description = "Echo text."
@@ -99,6 +108,20 @@ class RuntimeTests(unittest.TestCase):
             ],
         )
         self.assertEqual(events[-1].data["answer"], "done")
+
+    def test_forwards_streaming_model_deltas_as_events(self) -> None:
+        events: list[AgentEvent] = []
+
+        AgentRuntime(
+            StreamingQueueLLM([{"final_answer": "done"}]), ToolExecutor([])
+        ).run("test task", on_event=events.append)
+
+        deltas = [
+            event.data["delta"]
+            for event in events
+            if event.type is EventType.MODEL_DELTA
+        ]
+        self.assertEqual(deltas, ['{"final_answer":"', 'done"}'])
 
     def test_emits_failure_event_when_step_limit_is_exceeded(self) -> None:
         events: list[AgentEvent] = []

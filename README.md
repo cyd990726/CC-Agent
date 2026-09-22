@@ -7,6 +7,7 @@
 - 进程内任务状态
 - 读取/写入文件、文本搜索、Shell 命令四个工具
 - 最大执行步数、结构化协议校验和可恢复的工具错误
+- 基于 SSE 的模型响应流式接收与终端答案增量输出
 
 ## 运行
 
@@ -26,6 +27,8 @@ export MINI_AGENT_MODEL="your-model"
 export MINI_AGENT_API_KEY="your-api-key"
 # 可选，默认是 https://api.openai.com/v1
 export MINI_AGENT_BASE_URL="https://provider.example/v1"
+# 可选；账户有较低的 RPM 限制时建议主动配置
+export MINI_AGENT_MAX_RPM="3"
 
 python main.py --workspace ./workspace/test_project "创建 hello.py 并运行它"
 ```
@@ -43,6 +46,11 @@ python3 main.py --workspace ./workspace/test_project
 模型通过严格 JSON 协议选择工具或结束任务。文件工具被限制在 `--workspace`
 目录内；Shell 命令在该目录中运行。Phase 1 尚未提供完整沙箱，因而只应在可信、
 隔离的工作目录中运行。
+
+模型请求默认使用 OpenAI-compatible Chat Completions 的 `stream: true`。终端会
+增量显示 `final_answer` 的内容，而工具调用会在完整响应通过 JSON 校验后再执行。
+如果接口返回组织级 `max RPM` 限流，程序会自动识别该上限，并在后续请求前等待
+可用额度；也可以通过 `MINI_AGENT_MAX_RPM` 或 `--max-rpm` 提前配置。
 
 ## 测试
 

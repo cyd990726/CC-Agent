@@ -54,6 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--request-timeout", type=float, default=60.0)
     parser.add_argument(
+        "--max-rpm",
+        type=int,
+        default=os.environ.get("MINI_AGENT_MAX_RPM"),
+        help="maximum model requests per minute (also auto-detected from 429 errors)",
+    )
+    parser.add_argument(
         "--no-confirm",
         action="store_true",
         help="allow write_file and shell without confirmation",
@@ -96,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
         base_url=args.base_url,
         api_key=os.environ.get("MINI_AGENT_API_KEY"),
         timeout=args.request_timeout,
+        max_rpm=args.max_rpm,
     )
     runtime = AgentRuntime(model, executor, max_steps=args.max_steps)
     renderer = TerminalRenderer(console, verbose=args.verbose)

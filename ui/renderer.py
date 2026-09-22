@@ -1,6 +1,7 @@
 """Render agent events as a compact terminal transcript."""
 
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -10,6 +11,71 @@ from rich.status import Status
 from rich.text import Text
 
 from agent.events import AgentEvent, EventType
+
+
+class _JsonStringFieldStreamer:
+    """Extract and incrementally decode one JSON string field."""
+
+    def __init__(self, field: str) -> None:
+        self._pattern = re.compile(rf'"{re.escape(field)}"\s*:\s*"')
+        self._buffer = ""
+        self._started = False
+        self._escaped = False
+        self._unicode_digits: str | None = None
+        self.finished = False
+
+    def feed(self, chunk: str) -> str:
+        if self.finished:
+            return ""
+        if not self._started:
+            self._buffer += chunk
+            match = self._pattern.search(self._buffer)
+            if match is None:
+                return ""
+            chunk = self._buffer[match.end() :]
+            self._buffer = ""
+            self._started = True
+
+        output: list[str] = []
+        for character in chunk:
+            if self._unicode_digits is not None:
+                self._unicode_digits += character
+                if len(self._unicode_digits) == 4:
+                    codepoint = int(self._unicode_digits, 16)
+                    output.append(
+                        chr(codepoint)
+                        if not 0xD800 <= codepoint <= 0xDFFF
+                        else "�"
+                    )
+                    self._unicode_digits = None
+                    self._escaped = False
+                continue
+            if self._escaped:
+                if character == "u":
+                    self._unicode_digits = ""
+                    continue
+                output.append(
+                    {
+                        '"': '"',
+                        "\\": "\\",
+                        "/": "/",
+                        "b": "\b",
+                        "f": "\f",
+                        "n": "\n",
+                        "r": "\r",
+                        "t": "\t",
+                    }.get(character, character)
+                )
+                self._escaped = False
+                continue
+            if character == "\\":
+                self._escaped = True
+            elif character == '"':
+                self.finished = True
+                break
+            else:
+                output.append(character)
+        return "".join(output)
 
 
 class TerminalRenderer:
@@ -26,17 +92,36 @@ class TerminalRenderer:
         self.verbose = verbose
         self.output_limit = output_limit
         self._status: Status | None = None
+        self._answer_stream = _JsonStringFieldStreamer("final_answer")
+        self._streamed_answer = False
 
     def __call__(self, event: AgentEvent) -> None:
         if event.type is EventType.RUN_STARTED:
             return
         if event.type is EventType.MODEL_STARTED:
+            self._answer_stream = _JsonStringFieldStreamer("final_answer")
+            self._streamed_answer = False
             self._start_status("Agent 正在思考...")
+            return
+        if event.type is EventType.MODEL_DELTA:
+            text = self._answer_stream.feed(str(event.data.get("delta", "")))
+            if text:
+                if not self._streamed_answer:
+                    self._stop_status()
+                    self.console.print("\n[bold green]●[/] ", end="")
+                    self._streamed_answer = True
+                self.console.print(
+                    text,
+                    end="",
+                    markup=False,
+                    highlight=False,
+                    soft_wrap=True,
+                )
             return
         if event.type is EventType.MODEL_COMPLETED:
             self._stop_status()
             response = event.data.get("response", {})
-            if isinstance(response, Mapping):
+            if isinstance(response, Mapping) and not self._streamed_answer:
                 thought = response.get("thought")
                 if isinstance(thought, str) and thought.strip():
                     self.console.print(Text(f"● {thought.strip()}", style="dim"))
@@ -50,6 +135,9 @@ class TerminalRenderer:
         if event.type is EventType.RUN_COMPLETED:
             self._stop_status()
             answer = str(event.data.get("answer", ""))
+            if self._streamed_answer:
+                self.console.print("\n[bold green]✓ 完成[/]")
+                return
             self.console.print()
             self.console.print("[bold green]✓ 完成[/]")
             self.console.print(Markdown(answer))

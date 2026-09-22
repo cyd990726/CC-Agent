@@ -63,7 +63,14 @@ class AgentRuntime:
                     EventType.MODEL_STARTED,
                     step=state.steps + 1,
                 )
-                response = self.model.chat(state.messages)
+                response = self.model.stream_chat(
+                    state.messages,
+                    on_delta=lambda delta: self._emit(
+                        on_event,
+                        EventType.MODEL_DELTA,
+                        delta=delta,
+                    ),
+                )
                 state.steps += 1
                 self._record_model_response(state, response)
                 self._emit(

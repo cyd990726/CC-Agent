@@ -3,6 +3,7 @@ from io import StringIO
 
 from rich.console import Console
 
+from agent.events import AgentEvent, EventType
 from ui.permissions import SessionPermissionHandler
 from ui.renderer import TerminalRenderer
 
@@ -50,6 +51,29 @@ class RendererTests(unittest.TestCase):
 
         self.assertTrue(renderer.toggle_verbose())
         self.assertFalse(renderer.toggle_verbose())
+
+    def test_streams_only_final_answer_text(self) -> None:
+        output = StringIO()
+        renderer = TerminalRenderer(Console(file=output, force_terminal=False))
+
+        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        renderer(
+            AgentEvent(
+                EventType.MODEL_DELTA,
+                {"delta": '{"thought":"done","final_'},
+            )
+        )
+        renderer(
+            AgentEvent(
+                EventType.MODEL_DELTA,
+                {"delta": 'answer":"第一行\\n第二行"}'},
+            )
+        )
+        renderer(AgentEvent(EventType.RUN_COMPLETED, {"answer": "第一行\n第二行"}))
+
+        rendered = output.getvalue()
+        self.assertIn("第一行\n第二行", rendered)
+        self.assertNotIn('"final_answer"', rendered)
 
 
 if __name__ == "__main__":
