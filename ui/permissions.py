@@ -18,7 +18,7 @@ class SessionPermissionHandler:
         console: Console,
         *,
         protected_tools: frozenset[str] = frozenset(
-            {"edit_file", "write_file", "shell"}
+            {"edit_file", "write_file", "shell", "web_search", "fetch_url"}
         ),
         ask: Callable[[str], str] | None = None,
     ) -> None:
@@ -52,6 +52,8 @@ class SessionPermissionHandler:
             "edit_file": "Edit file",
             "write_file": "Write file",
             "shell": "Run command",
+            "web_search": "Search the web",
+            "fetch_url": "Fetch URL",
         }
         body.append(labels.get(tool_name, tool_name), style="bold")
         for name, value in args.items():

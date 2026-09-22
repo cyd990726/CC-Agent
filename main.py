@@ -10,13 +10,16 @@ from agent.runtime import AgentRuntime
 from model.llm import ChatCompletionsLLM
 from tools import (
     EditFileTool,
+    FetchUrlTool,
     FindFilesTool,
     ListFilesTool,
     ReadFileTool,
     SearchTool,
     ShellTool,
     ToolExecutor,
+    WebSearchTool,
     WriteFileTool,
+    create_search_provider,
 )
 from ui import SessionPermissionHandler, TerminalApp, TerminalRenderer
 
@@ -69,9 +72,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum model requests per minute (also auto-detected from 429 errors)",
     )
     parser.add_argument(
+        "--search-provider",
+        default=os.environ.get("MINI_AGENT_SEARCH_PROVIDER", "auto"),
+        choices=["auto", "tavily", "brave", "serper"],
+        help="web search provider (default: auto-detect from API key)",
+    )
+    parser.add_argument(
         "--no-confirm",
         action="store_true",
-        help="allow edit_file, write_file, and shell without confirmation",
+        help="allow sensitive tools without confirmation",
     )
     parser.add_argument(
         "--verbose",
@@ -96,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         console.print(
             "[bold yellow]警告：权限确认已关闭，Agent 可以直接写文件"
-            "和执行命令。[/]"
+            "、执行命令和访问网络。[/]"
         )
     executor = ToolExecutor(
         [
@@ -106,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
             FindFilesTool(workspace),
             ListFilesTool(workspace),
             SearchTool(workspace),
+            WebSearchTool(create_search_provider(args.search_provider)),
+            FetchUrlTool(timeout=args.request_timeout),
             ShellTool(workspace),
         ],
         permission_handler=permission_handler,

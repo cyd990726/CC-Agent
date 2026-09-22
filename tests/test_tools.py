@@ -2,14 +2,23 @@ import json
 import tempfile
 import unittest
 from collections.abc import Mapping
+from email.message import Message
 from pathlib import Path
 from typing import Any
+from urllib.request import Request
 
 from tools.base import Tool, ToolExecutor
 from tools.discovery import FindFilesTool, ListFilesTool
 from tools.file import EditFileTool, ReadFileTool, WriteFileTool
 from tools.search import SearchTool
 from tools.shell import ShellTool
+from tools.web import (
+    FetchUrlTool,
+    SearchProvider,
+    SearchResult,
+    WebSearchTool,
+    create_search_provider,
+)
 
 
 class ToolTests(unittest.TestCase):
@@ -152,6 +161,106 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(result["exit_code"], 3)
         self.assertEqual(result["stdout"], "hello")
         self.assertEqual(result["stderr"], "problem")
+
+    def test_web_search_returns_normalized_json(self) -> None:
+        class FakeProvider(SearchProvider):
+            name = "fake"
+
+            def search(self, query: str, max_results: int) -> list[SearchResult]:
+                self.call = (query, max_results)
+                return [
+                    SearchResult(
+                        title="Mini Agent",
+                        url="https://example.com/agent",
+                        snippet="A small coding agent.",
+                    )
+                ]
+
+        provider = FakeProvider()
+        output = WebSearchTool(provider).run(
+            {"query": "coding agents", "max_results": 3}
+        )
+
+        self.assertEqual(provider.call, ("coding agents", 3))
+        payload = json.loads(output)
+        self.assertEqual(payload["provider"], "fake")
+        self.assertEqual(payload["results"][0]["title"], "Mini Agent")
+
+    def test_search_provider_auto_detects_configured_key(self) -> None:
+        provider = create_search_provider(
+            environ={"BRAVE_SEARCH_API_KEY": "test-key"}
+        )
+
+        self.assertEqual(provider.name, "brave")
+
+    def test_unconfigured_web_search_is_recoverable(self) -> None:
+        provider = create_search_provider(environ={})
+        result = ToolExecutor([WebSearchTool(provider)]).execute(
+            "web_search", {"query": "news"}
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("not configured", result.output)
+
+    def test_fetch_url_extracts_html_and_ignores_scripts(self) -> None:
+        class FakeResponse:
+            def __init__(self) -> None:
+                self.headers = Message()
+                self.headers["Content-Type"] = "text/html; charset=utf-8"
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def geturl(self) -> str:
+                return "https://example.com/article"
+
+            def read(self, _limit: int) -> bytes:
+                return (
+                    b"<html><head><title>Example</title>"
+                    b"<script>secret()</script></head>"
+                    b"<body><h1>Hello</h1><p>Useful text</p></body></html>"
+                )
+
+        requests: list[Request] = []
+
+        def fake_open(request: Request, **_kwargs: object) -> FakeResponse:
+            requests.append(request)
+            return FakeResponse()
+
+        def public_resolver(*_args: object, **_kwargs: object) -> list[Any]:
+            return [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+        output = FetchUrlTool(
+            opener=fake_open,
+            resolver=public_resolver,
+        ).run({"url": "https://example.com/article"})
+
+        payload = json.loads(output)
+        self.assertEqual(payload["title"], "Example")
+        self.assertIn("Useful text", payload["content"])
+        self.assertNotIn("secret", payload["content"])
+        self.assertEqual(len(requests), 1)
+
+    def test_fetch_url_blocks_private_addresses_before_request(self) -> None:
+        called = False
+
+        def fake_open(*_args: object, **_kwargs: object) -> None:
+            nonlocal called
+            called = True
+
+        def private_resolver(*_args: object, **_kwargs: object) -> list[Any]:
+            return [(2, 1, 6, "", ("127.0.0.1", 80))]
+
+        result = ToolExecutor(
+            [FetchUrlTool(opener=fake_open, resolver=private_resolver)]
+        ).execute("fetch_url", {"url": "http://localhost/admin"})
+
+        self.assertFalse(result.success)
+        self.assertIn("private or non-public", result.output)
+        self.assertFalse(called)
 
     def test_permission_denial_is_a_recoverable_result(self) -> None:
         class RecordingTool(Tool):

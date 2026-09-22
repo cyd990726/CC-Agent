@@ -87,6 +87,16 @@ class PermissionHandlerTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual(len(prompts), 1)
 
+    def test_network_access_requires_permission(self) -> None:
+        prompts: list[str] = []
+        handler = SessionPermissionHandler(
+            self.console,
+            ask=lambda prompt: prompts.append(prompt) or "n",
+        )
+
+        self.assertFalse(handler("fetch_url", {"url": "https://example.com"}))
+        self.assertEqual(len(prompts), 1)
+
 
 class RendererTests(unittest.TestCase):
     def test_toggle_verbose(self) -> None:
