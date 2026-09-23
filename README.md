@@ -117,7 +117,7 @@ mini-agent --max-steps 100
 mini-agent --no-confirm
 ```
 
-交互界面支持 `/help`、`/clear`、`/status`、`/history`、`/verbose` 和
+交互界面支持 `/clear`、`/status`、`/history`、`/verbose` 和
 `/exit`。输入 `/` 会打开命令面板，可用 `Tab` / `Shift+Tab` 选择；长输入会
 自动折行并增高输入框，`Alt+Enter` 或 `Ctrl+J` 可以主动换行。
 

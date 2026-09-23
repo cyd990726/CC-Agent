@@ -10,6 +10,7 @@ from rich.console import Console
 
 from agent.events import AgentEvent, EventType
 from agent.runtime import AgentRuntime
+from ui.logo import LOGO_LINES, render_logo
 from ui.permissions import SessionPermissionHandler
 from ui.renderer import TerminalRenderer
 from ui.terminal import COMMANDS, SlashCommandCompleter, TerminalApp
@@ -44,6 +45,14 @@ class SlashCommandCompleterTests(unittest.TestCase):
 
 
 class TerminalAppTests(unittest.TestCase):
+    def test_logo_has_stable_dimensions_and_text_fallback(self) -> None:
+        self.assertEqual(len(LOGO_LINES), 3)
+
+        rendered = render_logo(color=False).plain
+
+        self.assertEqual(rendered.splitlines(), list(LOGO_LINES))
+        self.assertIn("o.o", rendered)
+
     def test_status_line_contains_model_and_workspace(self) -> None:
         output = StringIO()
         console = Console(file=output, force_terminal=False)
@@ -74,7 +83,7 @@ class TerminalAppTests(unittest.TestCase):
         self.assertEqual(measure("中文中文", 10, 24), 2)
 
     def test_completion_panel_padding_uses_display_width(self) -> None:
-        padded = TerminalApp._fit_cells("/help 查看命令", 20)
+        padded = TerminalApp._fit_cells("/status 查看当前配置", 20)
 
         from prompt_toolkit.utils import get_cwidth
 

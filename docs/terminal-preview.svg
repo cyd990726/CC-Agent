@@ -9,7 +9,7 @@
   <text x="550" y="34" fill="#71717a" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15">mini-agent</text>
   <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18">
     <text x="32" y="82" fill="#22d3ee" font-weight="700">✦ Mini Agent</text>
-    <text x="32" y="116" fill="#a1a1aa">Interactive coding agent · /help for commands</text>
+    <text x="32" y="116" fill="#a1a1aa">Interactive coding agent</text>
     <text x="32" y="170" fill="#22d3ee">●</text>
     <text x="58" y="170" fill="#f4f4f5" font-weight="700">Read</text>
     <text x="112" y="170" fill="#d4d4d8">src/app.py</text>
@@ -27,8 +27,8 @@
     <rect x="28" y="506" width="520" height="104" rx="10" fill="#111827" stroke="#52525b"/>
     <text x="46" y="536" fill="#71717a">Commands</text>
     <rect x="38" y="548" width="500" height="30" rx="5" fill="#164e63"/>
-    <text x="50" y="570" fill="#ecfeff" font-weight="700">› /help</text>
-    <text x="180" y="570" fill="#ecfeff">查看命令</text>
+    <text x="50" y="570" fill="#ecfeff" font-weight="700">› /clear</text>
+    <text x="180" y="570" fill="#ecfeff">清空终端</text>
     <text x="50" y="600" fill="#d4d4d8">  /status</text>
     <text x="180" y="600" fill="#a1a1aa">查看当前配置</text>
     <text x="40" y="650" fill="#22d3ee" font-weight="700">kimi-k2.5</text>

@@ -1,16 +1,19 @@
 """Persistent terminal REPL for Mini Agent."""
 
+import asyncio
 from collections.abc import Callable
+from io import StringIO
 from pathlib import Path
 
 from prompt_toolkit import Application
 from prompt_toolkit.application import get_app
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
-from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.formatted_text import ANSI, FormattedText
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.layout import (
     ConditionalContainer,
     HSplit,
@@ -30,11 +33,11 @@ from rich.text import Text
 
 from agent.runtime import AgentRuntime, AgentRuntimeError
 from model.llm import ModelError
+from ui.logo import LOGO_ANIMATION_FRAMES, render_logo
 from ui.renderer import TerminalRenderer
 
 
 COMMANDS = (
-    ("/help", "查看命令"),
     ("/clear", "清空终端"),
     ("/status", "查看当前配置"),
     ("/history", "查看本次会话任务"),
@@ -61,16 +64,35 @@ class SlashCommandCompleter(Completer):
                 )
 
 
+class SlashCommandLexer(Lexer):
+    """Color a slash command in the input field."""
+
+    def lex_document(self, document: Document):
+        def get_line(line_number: int):
+            line = document.lines[line_number]
+            if line.startswith("/"):
+                command, separator, remainder = line.partition(" ")
+                return [
+                    ("class:input-field.command", command),
+                    ("", separator + remainder),
+                ]
+            return [("", line)]
+
+        return get_line
+
+
 def _command_key_bindings() -> KeyBindings:
     bindings = KeyBindings()
 
     @bindings.add("tab")
-    def select_next(event) -> None:
+    def complete_command(event) -> None:
         buffer = event.app.current_buffer
         if buffer.complete_state is None:
             buffer.start_completion(select_first=True)
-        else:
-            buffer.complete_next()
+        state = buffer.complete_state
+        if state is not None and state.completions:
+            index = state.complete_index or 0
+            buffer.apply_completion(state.completions[index])
 
     @bindings.add("s-tab")
     def select_previous(event) -> None:
@@ -105,6 +127,7 @@ INPUT_STYLE = Style.from_dict(
         "input-frame.border": "#52525b",
         "input-field": "#f4f4f5",
         "input-field.prompt": "bold ansicyan",
+        "input-field.command": "bold #22d3ee",
         "session-status": "#71717a",
         "session-status.model": "#22d3ee bold",
         "session-status.separator": "#3f3f46",
@@ -113,6 +136,7 @@ INPUT_STYLE = Style.from_dict(
         "completion-panel.title": "#71717a bold",
         "completion-panel.item": "#d4d4d8",
         "completion-panel.current": "bg:#164e63 #ecfeff bold",
+        "completion-panel.match": "#67e8f9 bold",
     }
 )
 
@@ -138,9 +162,9 @@ class TerminalApp:
         self.history: list[str] = []
         self._input_history = InMemoryHistory()
         self._prompt = prompt or self._read_input
+        self._logo_animation_frame = 0
 
     def run(self) -> int:
-        self._show_header()
         while True:
             try:
                 task = self._prompt("❯ ").strip()
@@ -176,11 +200,8 @@ class TerminalApp:
         normalized = command.strip().lower()
         if normalized in {"/exit", "/quit"}:
             return True
-        if normalized == "/help":
-            self._show_help()
-        elif normalized == "/clear":
+        if normalized == "/clear":
             self.console.clear()
-            self._show_header()
         elif normalized == "/status":
             self._show_status()
         elif normalized == "/history":
@@ -200,30 +221,43 @@ class TerminalApp:
             self.console.print(f"[bright_black]完整工具输出已{label}。[/]")
         else:
             self.console.print(
-                f"[yellow]未知命令：{command}。使用 /help 查看帮助。[/]"
+                f"[yellow]未知命令：{command}。输入 / 查看可用命令。[/]"
             )
         return False
 
-    def _show_header(self) -> None:
+    def _header_content(self, frame: int = 0) -> Panel:
         body = Text()
-        body.append("Interactive coding agent", style="bold")
+        body.append("MINI AGENT", style="bold bright_cyan")
         body.append(
-            "\nDescribe a task, ask a question, or review some code.",
+            "\nYour compact coding companion",
             style="bright_black",
         )
-        self.console.print(
-            Panel(
-                body,
-                title="[bold bright_cyan] ✦ Mini Agent [/]",
-                subtitle="[bright_black]/help for commands[/]",
-                subtitle_align="right",
-                border_style="bright_black",
-                box=box.ROUNDED,
-                padding=(1, 2),
-                expand=False,
-            )
+        body.append(f"\n\nModel       {self.model_name}", style="bright_black")
+        body.append(
+            f"\nDirectory  {self._display_path(self.workspace)}",
+            style="bright_black",
         )
-        self.console.print()
+        content: Text | Table = body
+        if self.console.width >= 56:
+            content = Table.grid(padding=(0, 3))
+            content.add_column(no_wrap=True)
+            content.add_column(vertical="middle")
+            content.add_row(
+                render_logo(
+                    color=self.console.color_system is not None,
+                    frame=frame,
+                ),
+                body,
+            )
+        return Panel(
+            content,
+            subtitle="",
+            subtitle_align="right",
+            border_style="bright_black",
+            box=box.ROUNDED,
+            padding=(1, 2),
+            expand=False,
+        )
 
     def _show_status(self) -> None:
         table = Table(show_header=False, box=None, padding=(0, 2))
@@ -242,21 +276,6 @@ class TerminalApp:
             )
         )
 
-    def _show_help(self) -> None:
-        table = Table(box=None, show_header=False, padding=(0, 2))
-        table.add_column(style="bold bright_cyan", no_wrap=True)
-        table.add_column(style="bright_black")
-        for command, description in COMMANDS:
-            table.add_row(command, description)
-        self.console.print(
-            Panel.fit(
-                table,
-                title="[bold]Commands[/]",
-                border_style="bright_black",
-                box=box.ROUNDED,
-            )
-        )
-
     @staticmethod
     def _display_path(path: Path) -> str:
         try:
@@ -266,20 +285,36 @@ class TerminalApp:
         return "~" if str(relative) == "." else f"~/{relative}"
 
     def _read_input(self, _message: str) -> str:
+        self._refresh_header_frame()
         input_field = TextArea(
             prompt=FormattedText([("class:input-field.prompt", "› ")]),
             multiline=True,
             wrap_lines=True,
             completer=SlashCommandCompleter(),
-            complete_while_typing=True,
+            lexer=SlashCommandLexer(),
             history=self._input_history,
             style="class:input-field",
         )
+
+        def refresh_command_completions(buffer) -> None:
+            value = buffer.document.text_before_cursor
+            if value.startswith("/") and not any(char.isspace() for char in value):
+                buffer.complete_state = None
+                buffer.start_completion()
+            else:
+                buffer.complete_state = None
+
+        input_field.buffer.on_text_changed += refresh_command_completions
         input_field.window.height = lambda: self._input_height(input_field.text)
         status = Window(
             height=1,
             content=FormattedTextControl(self._status_fragments),
             style="class:session-status",
+        )
+        header = Window(
+            content=FormattedTextControl(self._header_fragments),
+            height=lambda: self._header_height,
+            dont_extend_height=True,
         )
         command_panel = ConditionalContainer(
             content=Window(
@@ -326,6 +361,7 @@ class TerminalApp:
         )
         container = HSplit(
             [
+                header,
                 bordered_input,
                 command_panel,
                 status,
@@ -337,6 +373,21 @@ class TerminalApp:
             style=INPUT_STYLE,
             full_screen=False,
         )
+
+        if self.console.is_terminal:
+            async def animate_logo() -> None:
+                while True:
+                    await asyncio.sleep(0.5)
+                    self._logo_animation_frame = (
+                        self._logo_animation_frame + 1
+                    ) % len(LOGO_ANIMATION_FRAMES)
+                    self._refresh_header_frame()
+                    application.invalidate()
+
+            def start_animation() -> None:
+                application.create_background_task(animate_logo())
+
+            return application.run(pre_run=start_animation)
         return application.run()
 
     @staticmethod
@@ -362,6 +413,8 @@ class TerminalApp:
         top = "╭" + title + "─" * max(0, inner_width - get_cwidth(title)) + "╮"
         bottom = "╰" + "─" * inner_width + "╯"
         current = state.complete_index
+        query = input_field.buffer.document.text_before_cursor
+        match_length = len(query)
         fragments: list[tuple[str, str]] = [
             ("class:completion-panel.border", top + "\n")
         ]
@@ -380,7 +433,18 @@ class TerminalApp:
             fragments.extend(
                 [
                     ("class:completion-panel.border", "│"),
-                    (style, content),
+                    (style, content[: get_cwidth(f" {marker} ")]),
+                    (
+                        "class:completion-panel.match",
+                        completion.display_text[:match_length],
+                    ),
+                    (
+                        style,
+                        content[
+                            get_cwidth(f" {marker} ")
+                            + len(completion.display_text[:match_length]) :
+                        ],
+                    ),
                     ("class:completion-panel.border", "│\n"),
                 ]
             )
@@ -435,3 +499,18 @@ class TerminalApp:
                 ("class:session-status.path", self._display_path(self.workspace)),
             ]
         )
+
+    def _header_fragments(self) -> ANSI:
+        return ANSI(self._header_markup)
+
+    def _refresh_header_frame(self) -> None:
+        output = StringIO()
+        header_console = Console(
+            file=output,
+            width=self.console.width,
+            force_terminal=self.console.color_system is not None,
+            color_system=self.console.color_system,
+        )
+        header_console.print(self._header_content(self._logo_animation_frame))
+        self._header_markup = output.getvalue()
+        self._header_height = max(1, self._header_markup.count("\n"))
