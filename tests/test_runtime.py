@@ -4,8 +4,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from agent.events import AgentEvent, EventType
-from agent.runtime import AgentRuntime, MaxStepsExceeded
-from model.llm import LLM
+from agent.runtime import AgentRuntime, AgentRuntimeError, MaxStepsExceeded
+from model.llm import LLM, ModelProtocolError
 from tools.base import Tool, ToolExecutor
 
 
@@ -26,6 +26,19 @@ class StreamingQueueLLM(QueueLLM):
             on_delta('{"final_answer":"')
             on_delta(str(response["final_answer"]) + '"}')
         return response
+
+
+class ProtocolErrorThenQueueLLM(QueueLLM):
+    def __init__(self, responses: list[Mapping[str, Any]]) -> None:
+        super().__init__(responses)
+        self.failures_remaining = 1
+
+    def stream_chat(self, messages, on_delta=None):
+        self.calls.append(list(messages))
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise ModelProtocolError("model did not return valid JSON")
+        return next(self.responses)
 
 
 class EchoTool(Tool):
@@ -69,6 +82,56 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertFalse(state.tool_results[0].success)
         self.assertIn("unknown tool", state.tool_results[0].output)
+
+    def test_model_protocol_error_is_returned_as_recoverable_observation(
+        self,
+    ) -> None:
+        model = ProtocolErrorThenQueueLLM([{"final_answer": "recovered"}])
+
+        state = AgentRuntime(model, ToolExecutor([])).run("test task")
+
+        self.assertTrue(state.finished)
+        self.assertEqual(state.final_answer, "recovered")
+        self.assertEqual(state.steps, 2)
+        observation = model.calls[1][-1]["content"]
+        self.assertTrue(observation.startswith("Observation:"))
+        payload = json.loads(observation.split("\n", 1)[1])
+        self.assertEqual(payload["tool"], "model_protocol")
+        self.assertFalse(payload["success"])
+        self.assertIn("1 protocol retries remaining", payload["output"])
+
+    def test_invalid_action_shape_can_be_retried(self) -> None:
+        model = QueueLLM(
+            [
+                {"action": "bad"},
+                {"action": {"tool": "echo", "args": {"text": "hello"}}},
+                {"final_answer": "done"},
+            ]
+        )
+
+        state = AgentRuntime(model, ToolExecutor([EchoTool()])).run("test task")
+
+        self.assertTrue(state.finished)
+        self.assertEqual(state.final_answer, "done")
+        self.assertEqual(state.tool_results[0].output, "hello")
+        observation = model.calls[1][-1]["content"]
+        payload = json.loads(observation.split("\n", 1)[1])
+        self.assertIn("action must be an object", payload["output"])
+
+    def test_model_protocol_errors_fail_after_two_retries(self) -> None:
+        model = QueueLLM(
+            [
+                {"action": "bad"},
+                {"action": {"tool": ""}},
+                {"final_answer": ""},
+            ]
+        )
+        runtime = AgentRuntime(model, ToolExecutor([]), max_steps=5)
+
+        with self.assertRaises(AgentRuntimeError) as caught:
+            runtime.run("test task")
+
+        self.assertIn("after 2 retries", str(caught.exception))
 
     def test_step_limit_preserves_state(self) -> None:
         model = QueueLLM([{"action": {"tool": "echo", "args": {"text": "x"}}}])

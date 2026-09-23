@@ -8,7 +8,7 @@ from agent.events import AgentEvent, EventType
 from agent.permissions import PermissionMode
 from agent.prompt import build_system_prompt
 from agent.state import AgentState
-from model.llm import LLM
+from model.llm import LLM, ModelProtocolError
 from tools.base import READ_ONLY_TOOL_NAMES, ToolExecutor
 
 
@@ -29,6 +29,8 @@ class MaxStepsExceeded(AgentRuntimeError):
 class AgentRuntime:
     """Coordinate an LLM and a collection of tools until the task is done."""
 
+    protocol_retry_limit = 2
+
     def __init__(
         self,
         model: LLM,
@@ -37,12 +39,16 @@ class AgentRuntime:
         max_steps: int = 20,
         plan_mode: bool = False,
         permission_mode: PermissionMode = PermissionMode.ASK,
+        protocol_retries: int = 2,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
+        if protocol_retries < 0:
+            raise ValueError("protocol_retries cannot be negative")
         self.model = model
         self.tools = tools
         self.max_steps = max_steps
+        self.protocol_retry_limit = protocol_retries
         self.plan_mode = False
         self.set_plan_mode(plan_mode)
         self.permission_mode = PermissionMode.ASK
@@ -81,6 +87,7 @@ class AgentRuntime:
         )
         state.add_message("user", task)
         self._emit(on_event, EventType.RUN_STARTED, task=task)
+        protocol_errors = 0
 
         try:
             for _ in range(self.max_steps):
@@ -89,27 +96,64 @@ class AgentRuntime:
                     EventType.MODEL_STARTED,
                     step=state.steps + 1,
                 )
-                response = self.model.stream_chat(
-                    state.messages,
-                    on_delta=lambda delta: self._emit(
+                try:
+                    response = self.model.stream_chat(
+                        state.messages,
+                        on_delta=lambda delta: self._emit(
+                            on_event,
+                            EventType.MODEL_DELTA,
+                            delta=delta,
+                        ),
+                    )
+                    state.steps += 1
+                    self._record_model_response(state, response)
+                    self._emit(
                         on_event,
-                        EventType.MODEL_DELTA,
-                        delta=delta,
-                    ),
-                )
-                state.steps += 1
-                self._record_model_response(state, response)
-                self._emit(
-                    on_event,
-                    EventType.MODEL_COMPLETED,
-                    step=state.steps,
-                    response=dict(response),
-                )
+                        EventType.MODEL_COMPLETED,
+                        step=state.steps,
+                        response=dict(response),
+                    )
+                except ModelProtocolError as exc:
+                    state.steps += 1
+                    protocol_errors += 1
+                    if protocol_errors > self.protocol_retry_limit:
+                        raise AgentRuntimeError(
+                            "model failed to follow the JSON action protocol "
+                            f"after {self.protocol_retry_limit} retries: {exc}"
+                        ) from exc
+                    self._emit(
+                        on_event,
+                        EventType.MODEL_COMPLETED,
+                        step=state.steps,
+                        response={"protocol_error": str(exc)},
+                    )
+                    state.add_message(
+                        "user",
+                        self._protocol_error_observation(
+                            exc,
+                            attempts_remaining=(
+                                self.protocol_retry_limit - protocol_errors
+                            ),
+                        ),
+                    )
+                    self._emit_protocol_error(on_event, str(exc))
+                    continue
 
                 has_action = "action" in response and response["action"] is not None
                 has_answer = "final_answer" in response
                 if has_action == has_answer:
+                    if self._record_protocol_error(
+                        state,
+                        on_event,
+                        "model response must contain exactly one of "
+                        "action or final_answer",
+                        protocol_errors,
+                    ):
+                        protocol_errors += 1
+                        continue
                     raise AgentRuntimeError(
+                        "model failed to follow the JSON action protocol "
+                        f"after {self.protocol_retry_limit} retries: "
                         "model response must contain exactly one of "
                         "action or final_answer"
                     )
@@ -117,7 +161,17 @@ class AgentRuntime:
                 if has_answer:
                     answer = response["final_answer"]
                     if not isinstance(answer, str) or not answer.strip():
+                        if self._record_protocol_error(
+                            state,
+                            on_event,
+                            "final_answer must be a non-empty string",
+                            protocol_errors,
+                        ):
+                            protocol_errors += 1
+                            continue
                         raise AgentRuntimeError(
+                            "model failed to follow the JSON action protocol "
+                            f"after {self.protocol_retry_limit} retries: "
                             "final_answer must be a non-empty string"
                         )
                     state.finished = True
@@ -130,7 +184,22 @@ class AgentRuntime:
                     )
                     return state
 
-                tool_name, args = self._parse_action(response["action"])
+                try:
+                    tool_name, args = self._parse_action(response["action"])
+                except AgentRuntimeError as exc:
+                    if self._record_protocol_error(
+                        state,
+                        on_event,
+                        str(exc),
+                        protocol_errors,
+                    ):
+                        protocol_errors += 1
+                        continue
+                    raise AgentRuntimeError(
+                        "model failed to follow the JSON action protocol "
+                        f"after {self.protocol_retry_limit} retries: {exc}"
+                    ) from exc
+                protocol_errors = 0
                 event_args = dict(args)
                 self._emit(
                     on_event,
@@ -176,6 +245,74 @@ class AgentRuntime:
     ) -> None:
         if handler is not None:
             handler(AgentEvent(event_type, data))
+
+    def _record_protocol_error(
+        self,
+        state: AgentState,
+        on_event: Callable[[AgentEvent], None] | None,
+        message: str,
+        protocol_errors: int,
+    ) -> bool:
+        attempts_remaining = self.protocol_retry_limit - protocol_errors - 1
+        if attempts_remaining < 0:
+            return False
+        state.add_message(
+            "user",
+            self._protocol_error_observation(
+                message,
+                attempts_remaining=attempts_remaining,
+            ),
+        )
+        self._emit(
+            on_event,
+            EventType.TOOL_COMPLETED,
+            result=self._protocol_error_result(message),
+        )
+        return True
+
+    def _emit_protocol_error(
+        self,
+        on_event: Callable[[AgentEvent], None] | None,
+        message: str,
+    ) -> None:
+        self._emit(
+            on_event,
+            EventType.TOOL_COMPLETED,
+            result=self._protocol_error_result(message),
+        )
+
+    @staticmethod
+    def _protocol_error_result(message: str) -> dict[str, Any]:
+        return {
+            "tool": "model_protocol",
+            "args": {},
+            "success": False,
+            "output": message,
+        }
+
+    @staticmethod
+    def _protocol_error_observation(
+        error: Exception | str,
+        *,
+        attempts_remaining: int,
+    ) -> str:
+        return (
+            "Observation:\n"
+            + json.dumps(
+                {
+                    "tool": "model_protocol",
+                    "args": {},
+                    "success": False,
+                    "output": (
+                        f"{error}. Reply with exactly one JSON object matching "
+                        "the action protocol. "
+                        f"{attempts_remaining} protocol retries remaining."
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
 
     @staticmethod
     def _record_model_response(

@@ -14,6 +14,11 @@ from typing import Any
 class ModelError(RuntimeError):
     """Raised when a model request or response is invalid."""
 
+
+class ModelProtocolError(ModelError):
+    """Raised when model content does not follow the agent JSON protocol."""
+
+
 # 抽象基类
 class LLM(ABC):
     """Minimal interface required by the agent runtime."""
@@ -227,7 +232,7 @@ def parse_json_object(content: str) -> Mapping[str, Any]:
     try:
         value = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ModelError("model did not return valid JSON") from exc
+        raise ModelProtocolError("model did not return valid JSON") from exc
     if not isinstance(value, dict):
-        raise ModelError("model response JSON must be an object")
+        raise ModelProtocolError("model response JSON must be an object")
     return value
