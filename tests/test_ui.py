@@ -56,12 +56,13 @@ class TerminalAppTests(unittest.TestCase):
     def test_status_line_contains_model_and_workspace(self) -> None:
         output = StringIO()
         console = Console(file=output, force_terminal=False)
+        workspace = Path("/tmp/example")
         app = TerminalApp(
             Mock(spec=AgentRuntime),
             TerminalRenderer(console),
             console,
             model_name="test-model",
-            workspace=Path("/tmp/example"),
+            workspace=workspace,
             prompt=lambda _message: "/exit",
         )
 
@@ -69,9 +70,10 @@ class TerminalAppTests(unittest.TestCase):
         rendered = "".join(text for _style, text in fragments)
 
         self.assertIn("test-model", rendered)
-        self.assertIn("/tmp/example", rendered)
+        expected_path = str(workspace)
+        self.assertIn(expected_path, rendered)
         model_style = next(style for style, text in fragments if text == "test-model")
-        path_style = next(style for style, text in fragments if text == "/tmp/example")
+        path_style = next(style for style, text in fragments if text == expected_path)
         self.assertNotEqual(model_style, path_style)
 
     def test_input_height_counts_wrapped_and_explicit_lines(self) -> None:

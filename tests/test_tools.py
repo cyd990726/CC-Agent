@@ -1,4 +1,8 @@
 import json
+import os
+import shlex
+import subprocess
+import sys
 import tempfile
 import unittest
 from collections.abc import Mapping
@@ -153,8 +157,18 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(output, "one.py:2:beta")
 
     def test_shell_captures_exit_code_and_streams(self) -> None:
+        script = (
+            "import sys; sys.stdout.write('hello'); "
+            "sys.stderr.write('problem'); sys.exit(3)"
+        )
+        command_args = [sys.executable, "-c", script]
+        command = (
+            subprocess.list2cmdline(command_args)
+            if os.name == "nt"
+            else shlex.join(command_args)
+        )
         output = ShellTool(self.workspace).run(
-            {"command": "printf hello; printf problem >&2; exit 3"}
+            {"command": command}
         )
         result = json.loads(output)
 
