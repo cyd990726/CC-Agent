@@ -1,5 +1,5 @@
 """Model adapters."""
 
-from .llm import ChatCompletionsLLM, LLM, ModelError
+from .llm import ChatCompletionsLLM, LLM, ModelError, ModelProtocolError
 
-__all__ = ["ChatCompletionsLLM", "LLM", "ModelError"]
+__all__ = ["ChatCompletionsLLM", "LLM", "ModelError", "ModelProtocolError"]
