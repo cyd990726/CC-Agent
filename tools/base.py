@@ -5,6 +5,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from agent.permissions import PermissionMode
+
+
+READ_ONLY_TOOL_NAMES = frozenset(
+    {"read_file", "find_files", "list_files", "search", "web_search", "fetch_url"}
+)
+
 
 class ToolError(RuntimeError):
     """A user-visible tool execution error."""
@@ -27,6 +34,17 @@ class Tool(ABC):
             "description": self.description,
             "args": dict(self.args_schema),
         }
+
+    def set_full_access(self, enabled: bool) -> None:
+        """Let tools with workspace boundaries expand them in Full Access mode."""
+
+    def requires_full_access(self, args: Mapping[str, Any]) -> bool:
+        """Return whether this call targets a resource outside its normal scope."""
+
+        return False
+
+    def set_temporary_full_access(self, enabled: bool) -> None:
+        """Grant a one-call scope expansion after user approval."""
 
 
 @dataclass(frozen=True)
@@ -53,20 +71,51 @@ class ToolExecutor:
         tools: Sequence[Tool],
         *,
         permission_handler: Callable[[str, Mapping[str, Any]], bool] | None = None,
+        allowed_tools: frozenset[str] | None = None,
+        permission_mode: PermissionMode = PermissionMode.ASK,
     ) -> None:
         self._tools: dict[str, Tool] = {}
         self._permission_handler = permission_handler
+        self._allowed_tools = allowed_tools
         for tool in tools:
             if not tool.name:
                 raise ValueError("tool name cannot be empty")
             if tool.name in self._tools:
                 raise ValueError(f"duplicate tool name: {tool.name}")
             self._tools[tool.name] = tool
+        self._permission_mode = PermissionMode.ASK
+        self.set_permission_mode(permission_mode)
 
     def describe(self) -> list[dict[str, Any]]:
-        return [tool.describe() for tool in self._tools.values()]
+        return [
+            tool.describe()
+            for name, tool in self._tools.items()
+            if self._allowed_tools is None or name in self._allowed_tools
+        ]
+
+    def set_allowed_tools(self, allowed_tools: frozenset[str] | None) -> None:
+        """Restrict or restore the registered tools available to the agent."""
+
+        self._allowed_tools = allowed_tools
+
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        """Apply a permission mode to tools and the interactive approval handler."""
+
+        self._permission_mode = mode
+        for tool in self._tools.values():
+            tool.set_full_access(mode is PermissionMode.FULL)
+        set_mode = getattr(self._permission_handler, "set_mode", None)
+        if set_mode is not None:
+            set_mode(mode)
 
     def execute(self, tool_name: str, args: Mapping[str, Any]) -> ToolResult:
+        if self._allowed_tools is not None and tool_name not in self._allowed_tools:
+            return ToolResult(
+                tool_name,
+                dict(args),
+                False,
+                f"tool {tool_name!r} is disabled by the current execution policy",
+            )
         tool = self._tools.get(tool_name)
         if tool is None:
             available = ", ".join(self._tools) or "none"
@@ -75,6 +124,19 @@ class ToolExecutor:
                 args=dict(args),
                 success=False,
                 output=f"unknown tool {tool_name!r}; available tools: {available}",
+            )
+        external_access = tool.requires_full_access(args)
+        if (
+            external_access
+            and self._permission_mode is not PermissionMode.FULL
+            and self._permission_handler is None
+        ):
+            return ToolResult(
+                tool_name,
+                dict(args),
+                False,
+                "path must stay inside the workspace unless user approval grants "
+                "outside access",
             )
         if self._permission_handler is not None:
             try:
@@ -88,6 +150,11 @@ class ToolExecutor:
                     False,
                     "execution denied by user",
                 )
+        temporary_access = (
+            external_access and self._permission_mode is not PermissionMode.FULL
+        )
+        if temporary_access:
+            tool.set_temporary_full_access(True)
         try:
             output = tool.run(args)
             return ToolResult(tool_name, dict(args), True, str(output))
@@ -95,6 +162,9 @@ class ToolExecutor:
             return ToolResult(
                 tool_name, dict(args), False, f"{type(exc).__name__}: {exc}"
             )
+        finally:
+            if temporary_access:
+                tool.set_temporary_full_access(False)
 
 
 def require_string(args: Mapping[str, Any], name: str) -> str:

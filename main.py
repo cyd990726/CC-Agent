@@ -9,6 +9,7 @@ from rich.console import Console
 
 from agent.config import run_init, user_config_path
 from agent.diagnostics import run_doctor
+from agent.permissions import PermissionMode
 from agent.runtime import AgentRuntime
 from model.llm import ChatCompletionsLLM
 from tools import (
@@ -91,7 +92,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-confirm",
         action="store_true",
-        help="allow sensitive tools without confirmation",
+        help="start in Full Access mode without confirmation",
+    )
+    parser.add_argument(
+        "--plan",
+        action="store_true",
+        help=(
+            "plan with read-only tools; do not modify files or run shell commands"
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -121,27 +129,34 @@ def main(argv: list[str] | None = None) -> int:
 
     workspace = Path(args.workspace).expanduser().resolve()
     console = Console()
-    permission_handler = None
-    if not args.no_confirm:
-        permission_handler = SessionPermissionHandler(console)
-    else:
+    initial_permission_mode = (
+        PermissionMode.FULL if args.no_confirm else PermissionMode.ASK
+    )
+    permission_handler = SessionPermissionHandler(
+        console,
+        workspace=workspace,
+        mode=initial_permission_mode,
+    )
+    if args.no_confirm:
         console.print(
-            "[bold yellow]警告：权限确认已关闭，Agent 可以直接写文件"
-            "、执行命令和访问网络。[/]"
+            "[bold yellow]警告：Full Access 已启用，Agent 可以访问工作区外文件、"
+            "执行命令和访问网络。[/]"
         )
+    tools = [
+        ReadFileTool(workspace),
+        EditFileTool(workspace),
+        WriteFileTool(workspace),
+        FindFilesTool(workspace),
+        ListFilesTool(workspace),
+        SearchTool(workspace),
+        WebSearchTool(create_search_provider(args.search_provider)),
+        FetchUrlTool(timeout=args.request_timeout),
+        ShellTool(workspace),
+    ]
     executor = ToolExecutor(
-        [
-            ReadFileTool(workspace),
-            EditFileTool(workspace),
-            WriteFileTool(workspace),
-            FindFilesTool(workspace),
-            ListFilesTool(workspace),
-            SearchTool(workspace),
-            WebSearchTool(create_search_provider(args.search_provider)),
-            FetchUrlTool(timeout=args.request_timeout),
-            ShellTool(workspace),
-        ],
+        tools,
         permission_handler=permission_handler,
+        permission_mode=initial_permission_mode,
     )
     model = ChatCompletionsLLM(
         model=args.model,
@@ -150,7 +165,13 @@ def main(argv: list[str] | None = None) -> int:
         timeout=args.request_timeout,
         max_rpm=args.max_rpm,
     )
-    runtime = AgentRuntime(model, executor, max_steps=args.max_steps)
+    runtime = AgentRuntime(
+        model,
+        executor,
+        max_steps=args.max_steps,
+        plan_mode=args.plan,
+        permission_mode=initial_permission_mode,
+    )
     renderer = TerminalRenderer(console, verbose=args.verbose)
     app = TerminalApp(
         runtime,
@@ -158,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
         console,
         model_name=args.model,
         workspace=workspace,
+        plan_mode=args.plan,
+        permission_handler=permission_handler,
     )
 
     task = " ".join(args.task).strip()

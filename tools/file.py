@@ -11,26 +11,59 @@ from tools.base import Tool, ToolError, require_string
 class WorkspaceTool(Tool):
     def __init__(self, workspace: str | Path) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
+        self.allow_outside_workspace = False
+        self._temporary_full_access = False
         if not self.workspace.is_dir():
             raise ValueError(f"workspace is not a directory: {self.workspace}")
+
+    def set_full_access(self, enabled: bool) -> None:
+        self.allow_outside_workspace = enabled
+
+    def set_temporary_full_access(self, enabled: bool) -> None:
+        self._temporary_full_access = enabled
+
+    @property
+    def can_access_outside_workspace(self) -> bool:
+        return self.allow_outside_workspace or self._temporary_full_access
+
+    def requires_full_access(self, args: Mapping[str, Any]) -> bool:
+        value = args.get("path")
+        if not isinstance(value, str) or not value:
+            return False
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.workspace / candidate
+        try:
+            candidate.resolve().relative_to(self.workspace)
+            return False
+        except (OSError, RuntimeError, ValueError):
+            return True
 
     def resolve_path(self, value: str) -> Path:
         candidate = Path(value).expanduser()
         if not candidate.is_absolute():
             candidate = self.workspace / candidate
         candidate = candidate.resolve()
+        if self.can_access_outside_workspace:
+            return candidate
         try:
             candidate.relative_to(self.workspace)
         except ValueError as exc:
             raise ToolError("path must stay inside the workspace") from exc
         return candidate
 
+    def display_path(self, path: Path) -> str:
+        try:
+            return path.relative_to(self.workspace).as_posix()
+        except ValueError:
+            return str(path)
+
 
 class ReadFileTool(WorkspaceTool):
     name = "read_file"
     description = "Read all or a line range from a UTF-8 workspace file."
     args_schema = {
-        "path": "string; path relative to the workspace",
+        "path": "string; path relative to the workspace unless Full Access is enabled",
         "offset": "optional positive integer; first line to read, 1-based",
         "limit": "optional positive integer; maximum lines to return",
     }
@@ -38,7 +71,7 @@ class ReadFileTool(WorkspaceTool):
     def run(self, args: Mapping[str, Any]) -> str:
         path = self.resolve_path(require_string(args, "path"))
         if not path.is_file():
-            raise ToolError(f"file does not exist: {path.relative_to(self.workspace)}")
+            raise ToolError(f"file does not exist: {self.display_path(path)}")
         content = path.read_text(encoding="utf-8")
         if "offset" not in args and "limit" not in args:
             return content
@@ -77,7 +110,7 @@ class WriteFileTool(WorkspaceTool):
     name = "write_file"
     description = "Create or replace a UTF-8 text file in the workspace."
     args_schema = {
-        "path": "string; path relative to the workspace",
+        "path": "string; path relative to the workspace unless Full Access is enabled",
         "content": "string; complete new file content",
     }
 
@@ -89,7 +122,7 @@ class WriteFileTool(WorkspaceTool):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         size = len(content.encode("utf-8"))
-        return f"wrote {size} bytes to {path.relative_to(self.workspace)}"
+        return f"wrote {size} bytes to {self.display_path(path)}"
 
 
 class EditFileTool(WorkspaceTool):
@@ -98,7 +131,7 @@ class EditFileTool(WorkspaceTool):
         "Replace one uniquely matching text block in a UTF-8 workspace file."
     )
     args_schema = {
-        "path": "string; path relative to the workspace",
+        "path": "string; path relative to the workspace unless Full Access is enabled",
         "old_text": "string; exact text that must occur exactly once",
         "new_text": "string; replacement text, which may be empty",
     }
@@ -106,7 +139,7 @@ class EditFileTool(WorkspaceTool):
     def run(self, args: Mapping[str, Any]) -> str:
         path = self.resolve_path(require_string(args, "path"))
         if not path.is_file():
-            raise ToolError(f"file does not exist: {path.relative_to(self.workspace)}")
+            raise ToolError(f"file does not exist: {self.display_path(path)}")
         old_text = require_string(args, "old_text")
         new_text = args.get("new_text")
         if not isinstance(new_text, str):
@@ -125,7 +158,7 @@ class EditFileTool(WorkspaceTool):
 
         updated = content.replace(old_text, new_text, 1)
         path.write_text(updated, encoding="utf-8")
-        relative = path.relative_to(self.workspace).as_posix()
+        relative = self.display_path(path)
         diff_lines = difflib.unified_diff(
             content.splitlines(keepends=True),
             updated.splitlines(keepends=True),

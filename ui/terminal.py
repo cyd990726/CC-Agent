@@ -32,12 +32,16 @@ from rich.table import Table
 from rich.text import Text
 
 from agent.runtime import AgentRuntime, AgentRuntimeError
+from agent.permissions import PermissionMode
 from model.llm import ModelError
+from ui.permissions import SessionPermissionHandler
 from ui.logo import LOGO_ANIMATION_FRAMES, render_logo
 from ui.renderer import TerminalRenderer
 
 
 COMMANDS = (
+    ("/plan", "切换只读计划模式"),
+    ("/permissions", "调整工具权限级别"),
     ("/clear", "清空终端"),
     ("/status", "查看当前配置"),
     ("/history", "查看本次会话任务"),
@@ -81,7 +85,7 @@ class SlashCommandLexer(Lexer):
         return get_line
 
 
-def _command_key_bindings() -> KeyBindings:
+def _command_key_bindings(cycle_mode: Callable[[], None]) -> KeyBindings:
     bindings = KeyBindings()
 
     @bindings.add("tab")
@@ -95,12 +99,9 @@ def _command_key_bindings() -> KeyBindings:
             buffer.apply_completion(state.completions[index])
 
     @bindings.add("s-tab")
-    def select_previous(event) -> None:
-        buffer = event.app.current_buffer
-        if buffer.complete_state is None:
-            buffer.start_completion(select_last=True)
-        else:
-            buffer.complete_previous()
+    def switch_mode(event) -> None:
+        cycle_mode()
+        event.app.invalidate()
 
     @bindings.add("enter")
     def submit_input(event) -> None:
@@ -132,6 +133,9 @@ INPUT_STYLE = Style.from_dict(
         "session-status.model": "#22d3ee bold",
         "session-status.separator": "#3f3f46",
         "session-status.path": "#a78bfa",
+        "session-status.mode.accept": "#4ade80 bold",
+        "session-status.mode.danger": "#ef4444 bold",
+        "session-status.mode.plan": "#facc15 bold",
         "completion-panel.border": "#52525b",
         "completion-panel.title": "#71717a bold",
         "completion-panel.item": "#d4d4d8",
@@ -152,6 +156,8 @@ class TerminalApp:
         *,
         model_name: str,
         workspace: Path,
+        plan_mode: bool = False,
+        permission_handler: SessionPermissionHandler | None = None,
         prompt: Callable[[str], str] | None = None,
     ) -> None:
         self.runtime = runtime
@@ -159,10 +165,16 @@ class TerminalApp:
         self.console = console
         self.model_name = model_name
         self.workspace = workspace
+        self.plan_mode = plan_mode
+        self.permission_handler = permission_handler
+        self._permission_mode_before_plan = (
+            self._current_permission_mode() if plan_mode else None
+        )
         self.history: list[str] = []
         self._input_history = InMemoryHistory()
         self._prompt = prompt or self._read_input
         self._logo_animation_frame = 0
+        self._show_session_header = True
 
     def run(self) -> int:
         while True:
@@ -200,7 +212,40 @@ class TerminalApp:
         normalized = command.strip().lower()
         if normalized in {"/exit", "/quit"}:
             return True
-        if normalized == "/clear":
+        if normalized == "/plan":
+            if self.plan_mode:
+                mode = self._permission_mode_before_plan or PermissionMode.ASK
+                self.plan_mode = False
+                self._permission_mode_before_plan = None
+                self.runtime.set_permission_mode(mode)
+                self.runtime.set_plan_mode(False)
+                self.console.print(
+                    f"[bright_black]计划模式已关闭，恢复为"
+                    f"{self._permission_mode_label(mode)}。[/]"
+                )
+            else:
+                self._permission_mode_before_plan = self._current_permission_mode()
+                self.plan_mode = True
+                self.runtime.set_plan_mode(True)
+                self.console.print("[bright_black]计划模式已开启（只读）。[/]")
+        elif normalized == "/permissions":
+            if self.permission_handler is not None:
+                mode = self.permission_handler.select_mode()
+                if mode is not None:
+                    mode_changed = mode is not self.runtime.permission_mode
+                    plan_was_active = self.plan_mode
+                    self.runtime.set_permission_mode(mode)
+                    if plan_was_active:
+                        self.plan_mode = False
+                        self._permission_mode_before_plan = None
+                        self.runtime.set_plan_mode(False)
+                    if mode_changed or plan_was_active:
+                        self.console.print(
+                            f"[bright_black]权限级别已切换为："
+                            f"{self._permission_mode_label(mode)}。"
+                            f"{'计划模式已关闭。' if plan_was_active else ''}[/]"
+                        )
+        elif normalized == "/clear":
             self.console.clear()
         elif normalized == "/status":
             self._show_status()
@@ -237,6 +282,14 @@ class TerminalApp:
             f"\nDirectory  {self._display_path(self.workspace)}",
             style="bright_black",
         )
+        if self.plan_mode:
+            body.append("\nMode       Plan · read-only", style="bold yellow")
+        elif self.permission_handler is not None:
+            body.append(
+                "\nPermissions  "
+                f"{self._permission_mode_label(self.permission_handler.mode)}",
+                style="bright_black",
+            )
         content: Text | Table = body
         if self.console.width >= 56:
             content = Table.grid(padding=(0, 3))
@@ -265,6 +318,12 @@ class TerminalApp:
         table.add_column()
         table.add_row("Model", self.model_name)
         table.add_row("Workspace", self._display_path(self.workspace))
+        table.add_row("Mode", "Plan · read-only" if self.plan_mode else "Normal")
+        if not self.plan_mode and self.permission_handler is not None:
+            table.add_row(
+                "Permissions",
+                self._permission_mode_label(self.permission_handler.mode),
+            )
         table.add_row("Tool output", "expanded" if self.renderer.verbose else "compact")
         table.add_row("Tasks", str(len(self.history)))
         self.console.print(
@@ -284,8 +343,18 @@ class TerminalApp:
             return str(path)
         return "~" if str(relative) == "." else f"~/{relative}"
 
+    @staticmethod
+    def _permission_mode_label(mode: PermissionMode) -> str:
+        return {
+            PermissionMode.ASK: "Ask for approval",
+            PermissionMode.APPROVE: "Approve for me",
+            PermissionMode.FULL: "Full Access",
+        }[mode]
+
     def _read_input(self, _message: str) -> str:
-        self._refresh_header_frame()
+        show_header = self._show_session_header
+        if show_header:
+            self._refresh_header_frame()
         input_field = TextArea(
             prompt=FormattedText([("class:input-field.prompt", "› ")]),
             multiline=True,
@@ -311,10 +380,13 @@ class TerminalApp:
             content=FormattedTextControl(self._status_fragments),
             style="class:session-status",
         )
-        header = Window(
-            content=FormattedTextControl(self._header_fragments),
-            height=lambda: self._header_height,
-            dont_extend_height=True,
+        header = ConditionalContainer(
+            content=Window(
+                content=FormattedTextControl(self._header_fragments),
+                height=lambda: self._header_height,
+                dont_extend_height=True,
+            ),
+            filter=Condition(lambda: self._show_session_header),
         )
         command_panel = ConditionalContainer(
             content=Window(
@@ -369,12 +441,12 @@ class TerminalApp:
         )
         application: Application[str] = Application(
             layout=Layout(container, focused_element=input_field),
-            key_bindings=_command_key_bindings(),
+            key_bindings=_command_key_bindings(self._cycle_mode),
             style=INPUT_STYLE,
             full_screen=False,
         )
 
-        if self.console.is_terminal:
+        if self.console.is_terminal and show_header:
             async def animate_logo() -> None:
                 while True:
                     await asyncio.sleep(0.5)
@@ -387,8 +459,14 @@ class TerminalApp:
             def start_animation() -> None:
                 application.create_background_task(animate_logo())
 
-            return application.run(pre_run=start_animation)
-        return application.run()
+            try:
+                return application.run(pre_run=start_animation)
+            finally:
+                self._show_session_header = False
+        try:
+            return application.run()
+        finally:
+            self._show_session_header = False
 
     @staticmethod
     def _has_completions(input_field: TextArea) -> bool:
@@ -491,14 +569,64 @@ class TerminalApp:
         )
 
     def _status_fragments(self) -> FormattedText:
-        return FormattedText(
-            [
-                ("class:session-status", "  "),
-                ("class:session-status.model", self.model_name),
-                ("class:session-status.separator", "  ·  "),
-                ("class:session-status.path", self._display_path(self.workspace)),
-            ]
+        path = self._display_path(self.workspace)
+        permission_mode = self._current_permission_mode()
+        left_width = (
+            2
+            + get_cwidth(self.model_name)
+            + get_cwidth("  ·  ")
+            + get_cwidth(path)
         )
+        if self.plan_mode:
+            modes = [("plan mode on", "class:session-status.mode.plan")]
+        elif permission_mode is PermissionMode.FULL:
+            modes = [("full access on", "class:session-status.mode.danger")]
+        elif permission_mode is PermissionMode.APPROVE:
+            modes = [("accept edits on", "class:session-status.mode.accept")]
+        else:
+            modes = []
+        mode_width = sum(get_cwidth(label) for label, _style in modes)
+        fragments = [
+            ("class:session-status", "  "),
+            ("class:session-status.model", self.model_name),
+            ("class:session-status.separator", "  ·  "),
+            ("class:session-status.path", path),
+        ]
+        if modes:
+            padding = " " * max(
+                2, self.console.width - left_width - mode_width
+            )
+            fragments.append(("class:session-status", padding))
+            for label, style in modes:
+                fragments.append((style, label))
+        return FormattedText(fragments)
+
+    def _cycle_mode(self) -> None:
+        """Cycle Ask → Accept edits → Full Access → Plan → Ask."""
+
+        if self.plan_mode:
+            self.plan_mode = False
+            mode = PermissionMode.ASK
+            self._permission_mode_before_plan = None
+        elif self._current_permission_mode() is PermissionMode.ASK:
+            mode = PermissionMode.APPROVE
+        elif self._current_permission_mode() is PermissionMode.APPROVE:
+            mode = PermissionMode.FULL
+        else:
+            self._permission_mode_before_plan = self._current_permission_mode()
+            self.plan_mode = True
+            mode = self._current_permission_mode()
+
+        self.runtime.set_permission_mode(mode)
+        self.runtime.set_plan_mode(self.plan_mode)
+
+    def _current_permission_mode(self) -> PermissionMode:
+        mode = getattr(self.runtime, "permission_mode", None)
+        if isinstance(mode, PermissionMode):
+            return mode
+        if self.permission_handler is not None:
+            return self.permission_handler.mode
+        return PermissionMode.ASK
 
     def _header_fragments(self) -> ANSI:
         return ANSI(self._header_markup)

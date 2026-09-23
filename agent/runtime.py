@@ -5,10 +5,11 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from agent.events import AgentEvent, EventType
+from agent.permissions import PermissionMode
 from agent.prompt import build_system_prompt
 from agent.state import AgentState
 from model.llm import LLM
-from tools.base import ToolExecutor
+from tools.base import READ_ONLY_TOOL_NAMES, ToolExecutor
 
 
 # 智能体运行时错误的基类
@@ -34,12 +35,30 @@ class AgentRuntime:
         tools: ToolExecutor,
         *,
         max_steps: int = 20,
+        plan_mode: bool = False,
+        permission_mode: PermissionMode = PermissionMode.ASK,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
         self.model = model
         self.tools = tools
         self.max_steps = max_steps
+        self.plan_mode = False
+        self.set_plan_mode(plan_mode)
+        self.permission_mode = PermissionMode.ASK
+        self.set_permission_mode(permission_mode)
+
+    def set_plan_mode(self, enabled: bool) -> None:
+        """Enable read-only planning or restore the full tool set."""
+
+        self.plan_mode = enabled
+        self.tools.set_allowed_tools(READ_ONLY_TOOL_NAMES if enabled else None)
+
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        """Change approval behavior and workspace access for future tool calls."""
+
+        self.permission_mode = mode
+        self.tools.set_permission_mode(mode)
 
     def run(
         self,
@@ -52,7 +71,14 @@ class AgentRuntime:
             raise ValueError("task cannot be empty")
 
         state = AgentState(current_task=task)
-        state.add_message("system", build_system_prompt(self.tools.describe()))
+        state.add_message(
+            "system",
+            build_system_prompt(
+                self.tools.describe(),
+                plan_mode=self.plan_mode,
+                permission_mode=self.permission_mode,
+            ),
+        )
         state.add_message("user", task)
         self._emit(on_event, EventType.RUN_STARTED, task=task)
 

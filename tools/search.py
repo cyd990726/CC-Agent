@@ -28,8 +28,7 @@ class SearchTool(WorkspaceTool):
             raise ToolError("path must be a non-empty string")
         root = self.resolve_path(path_value)
         if not root.exists():
-            relative_root = root.relative_to(self.workspace)
-            raise ToolError(f"search path does not exist: {relative_root}")
+            raise ToolError(f"search path does not exist: {self.display_path(root)}")
 
         glob = args.get("glob")
         if glob is not None and (not isinstance(glob, str) or not glob):
@@ -53,14 +52,15 @@ class SearchTool(WorkspaceTool):
         matches: list[str] = []
         for discovered_path in self._files(root):
             path = discovered_path.resolve()
-            try:
-                path.relative_to(self.workspace)
-            except ValueError:
-                continue
+            if not self.can_access_outside_workspace:
+                try:
+                    path.relative_to(self.workspace)
+                except ValueError:
+                    continue
             if glob and not fnmatch.fnmatch(path.name, glob):
                 continue
             try:
-                relative = path.relative_to(self.workspace)
+                relative = self.display_path(path)
                 with path.open(encoding="utf-8") as handle:
                     for line_number, line in enumerate(handle, 1):
                         if pattern.search(line):
