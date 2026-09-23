@@ -106,6 +106,7 @@ class AgentRuntime:
                         ),
                     )
                     state.steps += 1
+                    response = self._normalize_response(response)
                     self._record_model_response(state, response)
                     self._emit(
                         on_event,
@@ -325,6 +326,27 @@ class AgentRuntime:
         except (TypeError, ValueError) as exc:
             raise AgentRuntimeError("model response is not JSON serializable") from exc
         state.add_message("assistant", content)
+
+    @staticmethod
+    def _normalize_response(response: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Accept common final-answer variants without treating them as tools."""
+
+        action = response.get("action")
+        if not isinstance(action, Mapping):
+            return response
+        tool_name = action.get("tool")
+        if tool_name != "final_answer":
+            return response
+        args = action.get("args", {})
+        if not isinstance(args, Mapping):
+            return response
+        answer = args.get("answer", args.get("final_answer"))
+        if answer is None:
+            return response
+        normalized = dict(response)
+        normalized.pop("action", None)
+        normalized["final_answer"] = answer
+        return normalized
 
     @staticmethod
     def _parse_action(action: Any) -> tuple[str, Mapping[str, Any]]:
