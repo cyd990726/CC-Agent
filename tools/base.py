@@ -135,7 +135,8 @@ class ToolExecutor:
                 tool_name,
                 dict(args),
                 False,
-                "access outside the workspace requires user approval",
+                "path must stay inside the workspace unless user approval grants "
+                "outside access",
             )
         if self._permission_handler is not None:
             try:
