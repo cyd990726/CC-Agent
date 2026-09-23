@@ -39,7 +39,7 @@ class FindFilesTool(WorkspaceTool):
             relative_to_root = path.relative_to(root).as_posix()
             if not self._matches(relative_to_root, pattern):
                 continue
-            matches.append(path.relative_to(self.workspace).as_posix())
+            matches.append(self.display_path(path))
             if len(matches) >= max_results:
                 break
         return "\n".join(matches) if matches else "no files"
@@ -52,10 +52,11 @@ class FindFilesTool(WorkspaceTool):
             if not path.is_file():
                 continue
             resolved = path.resolve()
-            try:
-                resolved.relative_to(self.workspace)
-            except ValueError:
-                continue
+            if not self.can_access_outside_workspace:
+                try:
+                    resolved.relative_to(self.workspace)
+                except ValueError:
+                    continue
             yield resolved
 
     @staticmethod
@@ -115,10 +116,11 @@ class ListFilesTool(WorkspaceTool):
             if child.name in EXCLUDED_DIRECTORIES:
                 continue
             resolved = child.resolve()
-            try:
-                resolved.relative_to(self.workspace)
-            except ValueError:
-                continue
+            if not self.can_access_outside_workspace:
+                try:
+                    resolved.relative_to(self.workspace)
+                except ValueError:
+                    continue
             relative = child.relative_to(root).as_posix()
             if child.is_dir():
                 entries.append(f"{relative}/")

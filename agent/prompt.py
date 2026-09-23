@@ -4,6 +4,8 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
+from agent.permissions import PermissionMode
+
 
 SYSTEM_PROMPT = """You are a small coding agent operating inside a workspace.
 Work on the user's task by choosing one tool at a time and using each observation
@@ -27,9 +29,37 @@ Available tools:
 
 
 # 构建系统提示词
-def build_system_prompt(tool_descriptions: Sequence[dict[str, Any]]) -> str:
+def build_system_prompt(
+    tool_descriptions: Sequence[dict[str, Any]],
+    *,
+    plan_mode: bool = False,
+    permission_mode: PermissionMode = PermissionMode.ASK,
+) -> str:
     """Render the runtime prompt with the currently registered tools."""
 
-    return SYSTEM_PROMPT.replace(
+    prompt = SYSTEM_PROMPT.replace(
         "{tools}", json.dumps(tool_descriptions, ensure_ascii=False, indent=2)
     )
+    if plan_mode:
+        prompt += (
+            "\nPLAN MODE: This is a read-only planning run. Inspect the workspace "
+            "and return a concrete ordered plan. Do not modify files or ask to "
+            "execute commands. State assumptions and risks where relevant."
+        )
+    mode_instructions = {
+        PermissionMode.ASK: (
+            "Ask for approval mode: ask before edits, shell commands, network "
+            "access, or access outside the workspace."
+        ),
+        PermissionMode.APPROVE: (
+            "Approve for me mode: workspace file edits are approved automatically. "
+            "Ask before shell commands, network access, or access outside "
+            "the workspace."
+        ),
+        PermissionMode.FULL: (
+            "Full Access mode: file tools may access paths outside the workspace, "
+            "and tools run without approval."
+        ),
+    }
+    prompt += f"\n{mode_instructions[permission_mode]}"
+    return prompt
