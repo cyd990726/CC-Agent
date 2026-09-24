@@ -58,7 +58,8 @@ def build_system_prompt(
         ),
         PermissionMode.FULL: (
             "Full Access mode: file tools may access paths outside the workspace, "
-            "and tools run without approval."
+            "and tools run without approval. If shell sandboxing is enabled in "
+            "configuration, shell commands still run inside that sandbox."
         ),
     }
     prompt += f"\n{mode_instructions[permission_mode]}"

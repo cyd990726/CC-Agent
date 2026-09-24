@@ -11,6 +11,7 @@ from agent.config import run_init, user_config_path
 from agent.diagnostics import run_doctor
 from agent.permissions import PermissionMode
 from agent.runtime import AgentRuntime
+from agent.sandbox import SandboxManager
 from model.llm import ChatCompletionsLLM
 from tools import (
     EditFileTool,
@@ -144,8 +145,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_confirm:
         console.print(
             "[bold yellow]警告：Full Access 已启用，Agent 可以访问工作区外文件、"
-            "执行命令和访问网络。[/]"
+            "执行命令和访问网络；已启用的 shell sandbox 仍会继续生效。[/]"
         )
+    sandbox = SandboxManager.from_env(workspace)
     tools = [
         ReadFileTool(workspace),
         EditFileTool(workspace),
@@ -155,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
         SearchTool(workspace),
         WebSearchTool(create_search_provider(args.search_provider)),
         FetchUrlTool(timeout=args.request_timeout),
-        ShellTool(workspace),
+        ShellTool(workspace, sandbox=sandbox),
     ]
     executor = ToolExecutor(
         tools,
