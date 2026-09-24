@@ -177,6 +177,30 @@ class PermissionHandlerTests(unittest.TestCase):
 
 
 class RendererTests(unittest.TestCase):
+    class FakeLive:
+        instances: list["RendererTests.FakeLive"] = []
+
+        def __init__(self, renderable, **kwargs) -> None:
+            self.renderable = renderable
+            self.kwargs = kwargs
+            self.started = False
+            self.stopped = False
+            self.updates = []
+            self.__class__.instances.append(self)
+
+        def start(self) -> None:
+            self.started = True
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def update(self, renderable, *, refresh: bool = False) -> None:
+            self.renderable = renderable
+            self.updates.append((renderable, refresh))
+
+    def setUp(self) -> None:
+        self.FakeLive.instances = []
+
     def test_toggle_verbose(self) -> None:
         renderer = TerminalRenderer(
             Console(file=StringIO(), force_terminal=False), verbose=False
@@ -210,6 +234,112 @@ class RendererTests(unittest.TestCase):
         self.assertIn("第一行", rendered)
         self.assertIn("第二行", rendered)
         self.assertNotIn('"final_answer"', rendered)
+
+    def test_streaming_answer_does_not_repeat_previous_text(self) -> None:
+        output = StringIO()
+        renderer = TerminalRenderer(Console(file=output, force_terminal=False))
+
+        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        renderer(
+            AgentEvent(
+                EventType.MODEL_DELTA,
+                {"delta": '{"final_answer":"项目当前状态'},
+            )
+        )
+        renderer(
+            AgentEvent(
+                EventType.MODEL_DELTA,
+                {"delta": '\\n你在分支上"}'},
+            )
+        )
+        renderer(
+            AgentEvent(
+                EventType.RUN_COMPLETED,
+                {"answer": "项目当前状态\n你在分支上", "steps": 1},
+            )
+        )
+
+        rendered = output.getvalue()
+        self.assertEqual(rendered.count("项目当前状态"), 1)
+        self.assertEqual(rendered.count("你在分支上"), 1)
+
+    def test_streaming_answer_is_rendered_as_markdown_once_on_completion(self) -> None:
+        output = StringIO()
+        renderer = TerminalRenderer(Console(file=output, force_terminal=False))
+
+        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        renderer(
+            AgentEvent(
+                EventType.MODEL_DELTA,
+                {"delta": '{"final_answer":"### 标题\\n- 条目"}'},
+            )
+        )
+        renderer(
+            AgentEvent(
+                EventType.RUN_COMPLETED,
+                {"answer": "### 标题\n- 条目", "steps": 1},
+            )
+        )
+
+        rendered = output.getvalue()
+        self.assertEqual(rendered.count("标题"), 1)
+        self.assertEqual(rendered.count("条目"), 1)
+        self.assertNotIn("### 标题", rendered)
+
+    def test_streaming_preview_waits_for_complete_line(self) -> None:
+        output = StringIO()
+        renderer = TerminalRenderer(
+            Console(file=output, force_terminal=True),
+            live_factory=self.FakeLive,
+        )
+
+        renderer(
+            AgentEvent(
+                EventType.MODEL_DELTA,
+                {"delta": '{"final_answer":"半行'},
+            )
+        )
+
+        self.assertEqual(self.FakeLive.instances, [])
+
+        renderer(
+            AgentEvent(
+                EventType.MODEL_DELTA,
+                {"delta": '\\n下一'},
+            )
+        )
+
+        self.assertEqual(len(self.FakeLive.instances), 1)
+        live = self.FakeLive.instances[0]
+        self.assertTrue(live.started)
+        self.assertTrue(live.kwargs["transient"])
+        self.assertEqual(live.renderable.renderables[1].markup, "半行\n")
+
+    def test_streaming_preview_is_cleared_before_final_answer(self) -> None:
+        output = StringIO()
+        renderer = TerminalRenderer(
+            Console(file=output, force_terminal=True),
+            live_factory=self.FakeLive,
+        )
+
+        renderer(
+            AgentEvent(
+                EventType.MODEL_DELTA,
+                {"delta": '{"final_answer":"预览行\\n最终行"}'},
+            )
+        )
+        renderer(
+            AgentEvent(
+                EventType.RUN_COMPLETED,
+                {"answer": "预览行\n最终行", "steps": 1},
+            )
+        )
+
+        self.assertEqual(len(self.FakeLive.instances), 1)
+        self.assertTrue(self.FakeLive.instances[0].stopped)
+        rendered = output.getvalue()
+        self.assertEqual(rendered.count("预览行"), 1)
+        self.assertEqual(rendered.count("最终行"), 1)
 
     def test_shell_output_is_compact_by_default(self) -> None:
         output = StringIO()

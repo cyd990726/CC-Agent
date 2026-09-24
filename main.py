@@ -112,10 +112,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    safe_cwd = recover_cwd()
     if arguments and arguments[0] == "init":
         return _run_init_command(arguments[1:])
 
-    loaded_configs = load_configuration()
+    loaded_configs = load_configuration(cwd=safe_cwd)
     if arguments and arguments[0] == "doctor":
         return _run_doctor_command(arguments[1:], loaded_configs)
 
@@ -127,7 +128,10 @@ def main(argv: list[str] | None = None) -> int:
             "run `mini-agent init` to configure it"
         )
 
-    workspace = Path(args.workspace).expanduser().resolve()
+    workspace_path = Path(args.workspace).expanduser()
+    if not workspace_path.is_absolute():
+        workspace_path = safe_cwd / workspace_path
+    workspace = workspace_path.resolve()
     console = Console()
     initial_permission_mode = (
         PermissionMode.FULL if args.no_confirm else PermissionMode.ASK
@@ -193,7 +197,7 @@ def load_configuration(*, cwd: Path | None = None) -> list[Path]:
     """Load project then user configuration, preserving shell precedence."""
 
     loaded: list[Path] = []
-    local_path = (cwd or Path.cwd()) / ".env"
+    local_path = (cwd or recover_cwd()) / ".env"
     user_path = user_config_path()
     for path in (local_path, user_path):
         if path in loaded or not path.is_file():
@@ -201,6 +205,24 @@ def load_configuration(*, cwd: Path | None = None) -> list[Path]:
         load_env_file(path)
         loaded.append(path)
     return loaded
+
+
+def recover_cwd() -> Path:
+    """Return a usable cwd, recovering when the process starts in a deleted path."""
+
+    try:
+        return Path.cwd()
+    except FileNotFoundError:
+        pwd = os.environ.get("PWD", "")
+        if pwd:
+            candidate = Path(pwd).expanduser()
+            for path in (candidate, *candidate.parents):
+                if path.is_dir():
+                    os.chdir(path)
+                    return path.resolve()
+        home = Path.home()
+        os.chdir(home)
+        return home.resolve()
 
 
 def _run_init_command(argv: list[str]) -> int:

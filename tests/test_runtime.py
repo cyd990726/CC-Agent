@@ -83,6 +83,24 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(state.tool_results[0].success)
         self.assertIn("unknown tool", state.tool_results[0].output)
 
+    def test_final_answer_tool_shape_is_normalized(self) -> None:
+        model = QueueLLM(
+            [
+                {
+                    "action": {
+                        "tool": "final_answer",
+                        "args": {"answer": "done"},
+                    }
+                }
+            ]
+        )
+
+        state = AgentRuntime(model, ToolExecutor([])).run("test task")
+
+        self.assertTrue(state.finished)
+        self.assertEqual(state.final_answer, "done")
+        self.assertEqual(state.tool_results, [])
+
     def test_model_protocol_error_is_returned_as_recoverable_observation(
         self,
     ) -> None:

@@ -6,7 +6,7 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.status import Status
@@ -104,16 +104,20 @@ class TerminalRenderer:
         verbose: bool = False,
         output_limit: int = 1200,
         output_lines: int = 10,
+        live_factory: type[Live] = Live,
     ) -> None:
         self.console = console
         self.verbose = verbose
         self.output_limit = output_limit
         self.output_lines = output_lines
+        self.live_factory = live_factory
         self._status: Status | None = None
         self._live_answer: Live | None = None
         self._answer_stream = _JsonStringFieldStreamer("final_answer")
         self._answer_text = ""
+        self._visible_answer_text = ""
         self._streamed_answer = False
+        self._has_answer_stream = False
         self._run_started_at: float | None = None
         self._tool_started_at: float | None = None
 
@@ -124,7 +128,9 @@ class TerminalRenderer:
         if event.type is EventType.MODEL_STARTED:
             self._answer_stream = _JsonStringFieldStreamer("final_answer")
             self._answer_text = ""
+            self._visible_answer_text = ""
             self._streamed_answer = False
+            self._has_answer_stream = False
             step = event.data.get("step", 1)
             self._start_status(f"Thinking · step {step}")
             return
@@ -134,7 +140,7 @@ class TerminalRenderer:
         if event.type is EventType.MODEL_COMPLETED:
             self._stop_status()
             response = event.data.get("response", {})
-            if isinstance(response, Mapping) and not self._streamed_answer:
+            if isinstance(response, Mapping) and not self._has_answer_stream:
                 thought = response.get("thought")
                 if isinstance(thought, str) and thought.strip():
                     self.console.print(Text(f"  {thought.strip()}", style=MUTED))
@@ -169,30 +175,19 @@ class TerminalRenderer:
         if not text:
             return
         self._answer_text += text
-        if not self._streamed_answer:
+        self._has_answer_stream = True
+        if self._status is not None:
             self._stop_status()
-            self.console.print()
-            self.console.print(f"[bold {ACCENT}]✦ Mini Agent[/]")
-            self._live_answer = Live(
-                Markdown(self._answer_text),
-                console=self.console,
-                refresh_per_second=16,
-                vertical_overflow="visible",
-            )
-            self._live_answer.start()
-            self._streamed_answer = True
-        elif self._live_answer is not None:
-            self._live_answer.update(Markdown(self._answer_text), refresh=False)
+        self._update_live_answer()
 
     def _render_completion(self, data: Mapping[str, Any]) -> None:
         self._stop_status()
-        if self._streamed_answer:
-            self._stop_live_answer()
-        else:
-            answer = str(data.get("answer", ""))
-            self.console.print()
-            self.console.print(f"[bold {ACCENT}]✦ Mini Agent[/]")
-            self.console.print(Markdown(answer))
+        self._stop_live_answer()
+        answer = str(data.get("answer", ""))
+        self.console.print()
+        self.console.print(f"[bold {ACCENT}]✦ Mini Agent[/]")
+        self.console.print(Markdown(answer))
+        self._streamed_answer = self._has_answer_stream
 
         elapsed = self._elapsed(self._run_started_at)
         steps = data.get("steps", 0)
@@ -211,10 +206,40 @@ class TerminalRenderer:
             self._status.stop()
             self._status = None
 
+    def _update_live_answer(self) -> None:
+        visible_text = self._stable_streaming_text(self._answer_text)
+        if not visible_text:
+            return
+        if visible_text == self._visible_answer_text:
+            return
+        self._visible_answer_text = visible_text
+        preview = Group(Text("✦ Mini Agent", style=f"bold {ACCENT}"), Markdown(visible_text))
+        if self._live_answer is None:
+            if not self.console.is_terminal:
+                return
+            self._live_answer = self.live_factory(
+                preview,
+                console=self.console,
+                refresh_per_second=12,
+                transient=True,
+                vertical_overflow="visible",
+            )
+            self._live_answer.start()
+            self._streamed_answer = True
+            return
+        self._live_answer.update(preview, refresh=True)
+
     def _stop_live_answer(self) -> None:
         if self._live_answer is not None:
             self._live_answer.stop()
             self._live_answer = None
+
+    @staticmethod
+    def _stable_streaming_text(text: str) -> str:
+        last_newline = text.rfind("\n")
+        if last_newline < 0:
+            return ""
+        return text[: last_newline + 1]
 
     def _render_tool_request(self, data: Mapping[str, Any]) -> None:
         tool = str(data.get("tool", "unknown"))

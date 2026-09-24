@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from main import build_parser, load_configuration, load_env_file
+from main import build_parser, load_configuration, load_env_file, recover_cwd
 
 
 class LoadEnvFileTests(unittest.TestCase):
@@ -50,6 +50,21 @@ class LoadEnvFileTests(unittest.TestCase):
                 self.assertEqual(os.environ["MINI_AGENT_MODEL"], "local")
                 self.assertEqual(os.environ["MINI_AGENT_API_KEY"], "secret")
                 self.assertEqual(loaded, [local_config, user_config])
+
+    def test_recover_cwd_uses_existing_pwd_parent_when_cwd_was_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            existing_parent = Path(directory) / "deleted"
+            deleted_child = existing_parent / "child"
+            existing_parent.mkdir()
+            with (
+                patch("main.Path.cwd", side_effect=FileNotFoundError),
+                patch("main.os.chdir") as chdir,
+                patch.dict(os.environ, {"PWD": str(deleted_child)}, clear=True),
+            ):
+                recovered = recover_cwd()
+
+            self.assertEqual(recovered, existing_parent.resolve())
+            chdir.assert_called_once_with(existing_parent)
 
     def test_max_steps_can_come_from_environment(self) -> None:
         with patch.dict(os.environ, {"MINI_AGENT_MAX_STEPS": "75"}, clear=True):
