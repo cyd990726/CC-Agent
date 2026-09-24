@@ -87,6 +87,19 @@ class SandboxTests(unittest.TestCase):
             with self.assertRaisesRegex(SandboxError, "unavailable"):
                 manager.wrap_shell_command("pwd", Path(directory))
 
+    def test_disabled_env_does_not_probe_home_or_temp_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("agent.sandbox.Path.home", side_effect=RuntimeError),
+                patch("agent.sandbox.sandbox_temp_dir", side_effect=AssertionError),
+            ):
+                manager = SandboxManager.from_env(
+                    Path(directory),
+                    environ={},
+                )
+
+        self.assertFalse(manager.config.enabled)
+
     def test_bubblewrap_backend_adds_network_isolation_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)

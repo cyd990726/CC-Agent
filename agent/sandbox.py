@@ -143,6 +143,8 @@ class SandboxManager:
     ) -> "SandboxManager":
         env = os.environ if environ is None else environ
         enabled = _env_bool(env, "MINI_AGENT_SANDBOX", default=False)
+        if not enabled:
+            return cls.disabled()
         config = SandboxConfig(
             enabled=enabled,
             write_roots=(workspace.expanduser().resolve(), sandbox_temp_dir()),
@@ -192,7 +194,10 @@ def sandbox_temp_dir() -> Path:
 
 
 def default_sensitive_paths(home: Path | None = None) -> tuple[Path, ...]:
-    root = home or Path.home()
+    try:
+        root = home or Path.home()
+    except RuntimeError:
+        return ()
     return tuple(
         path
         for path in (
