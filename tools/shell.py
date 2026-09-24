@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from agent.sandbox import SandboxManager
 from tools.base import Tool, ToolError, require_string
 
 
@@ -19,11 +20,18 @@ class ShellTool(Tool):
         "timeout": "optional number of seconds; defaults to 60",
     }
 
-    def __init__(self, workspace: str | Path, *, default_timeout: float = 60.0) -> None:
+    def __init__(
+        self,
+        workspace: str | Path,
+        *,
+        default_timeout: float = 60.0,
+        sandbox: SandboxManager | None = None,
+    ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         if not self.workspace.is_dir():
             raise ValueError(f"workspace is not a directory: {self.workspace}")
         self.default_timeout = default_timeout
+        self.sandbox = sandbox or SandboxManager.disabled()
 
     def run(self, args: Mapping[str, Any]) -> str:
         command = require_string(args, "command")
@@ -34,11 +42,20 @@ class ShellTool(Tool):
             or timeout <= 0
         ):
             raise ToolError("timeout must be a positive number")
+        if self.sandbox.config.enabled:
+            command_or_argv: str | list[str] = self.sandbox.wrap_shell_command(
+                command,
+                self.workspace,
+            )
+            shell = False
+        else:
+            command_or_argv = command
+            shell = True
         try:
             completed = subprocess.run(
-                command,
+                command_or_argv,
                 cwd=self.workspace,
-                shell=True,
+                shell=shell,
                 text=True,
                 capture_output=True,
                 timeout=float(timeout),

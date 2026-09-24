@@ -15,6 +15,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from agent.sandbox import sandbox_status
 from tools.web import create_search_provider
 
 
@@ -80,6 +81,8 @@ def collect_diagnostics(
             shell_path or "未检测到；shell 工具可能不可用",
         )
     )
+    status, detail = sandbox_status(workspace)
+    checks.append(Diagnostic(status, "Shell sandbox", detail))
     search_provider = create_search_provider()
     checks.append(
         Diagnostic(

@@ -87,6 +87,17 @@ MINI_AGENT_SEARCH_PROVIDER="tavily"
 TAVILY_API_KEY="your-tavily-key"
 ```
 
+可选 Shell sandbox：
+
+```bash
+MINI_AGENT_SANDBOX="1"
+```
+
+Linux 需要安装 `bubblewrap`；macOS 会尝试使用系统 `sandbox-exec`。启用后，
+Linux 上的 `shell` 命令默认只能写入 workspace 和 Mini Agent 临时目录；
+shell 命令默认不能出网。macOS 当前仅提供网络隔离 MVP，
+不承诺完整文件系统隔离。`mini-agent doctor` 会显示 sandbox 可用性。
+
 ## 使用
 
 进入持续交互界面：
@@ -150,16 +161,19 @@ API Key，并会拒绝本机、内网地址、非 HTTP(S) 协议、超大响应�
 ## 安全说明
 
 > [!WARNING]
-> Mini Agent 仍处于 Alpha 阶段，不是完整沙箱。请只在可信、隔离且已纳入版本控制的
+> Mini Agent 仍处于 Alpha 阶段。Shell sandbox 默认关闭，启用前请先运行
+> `mini-agent doctor` 检查本机依赖；未启用时，请只在可信、隔离且已纳入版本控制的
 > 工作目录中运行。
 
 - 默认情况下，文件工具被限制在 `--workspace` 内。
 - `--plan` 只开放读取、搜索和网页读取工具；文件写入、编辑和 Shell 工具不会注册。
 - 默认 Ask for approval 模式会确认文件修改、Shell 和联网操作；确认卡片显示文件 diff 或完整命令。
 - 联网默认需要确认。
-- `shell` 虽然从 workspace 启动，但命令仍可能访问工作区外的文件和系统资源。
+- `shell` 默认从 workspace 启动；启用 `MINI_AGENT_SANDBOX=1` 后，会先通过
+  Linux `bubblewrap` 或 macOS `sandbox-exec` 包装再执行。
 - `/permissions` 提供 Ask for approval、Approve for me 和 Full Access 三档。
   Approve for me 访问工作区外路径时需要确认；Full Access 允许文件工具访问工作区外路径并跳过确认。
+- Full Access 不会自动关闭已启用的 Shell sandbox。
 - `--no-confirm` 会以 Full Access 启动，只应在临时容器或其他隔离环境中使用。
 - 不要把 `.env`、API Key 或包含凭据的日志提交到仓库。
 
