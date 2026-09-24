@@ -136,6 +136,21 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual(kwargs["shell"], False)
         self.assertEqual(run.call_args.args[0], ["/fake-sandbox", "echo hi"])
 
+    def test_shell_tool_uses_native_shell_when_sandbox_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            completed = subprocess.CompletedProcess(
+                args="echo hi",
+                returncode=0,
+                stdout="hi\n",
+                stderr="",
+            )
+            with patch("tools.shell.subprocess.run", return_value=completed) as run:
+                output = ShellTool(Path(directory)).run({"command": "echo hi"})
+
+        self.assertIn('"stdout": "hi\\n"', output)
+        self.assertEqual(run.call_args.args[0], "echo hi")
+        self.assertTrue(run.call_args.kwargs["shell"])
+
 
 if __name__ == "__main__":
     unittest.main()

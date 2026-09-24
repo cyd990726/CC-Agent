@@ -42,12 +42,20 @@ class ShellTool(Tool):
             or timeout <= 0
         ):
             raise ToolError("timeout must be a positive number")
-        argv = self.sandbox.wrap_shell_command(command, self.workspace)
+        if self.sandbox.config.enabled:
+            command_or_argv: str | list[str] = self.sandbox.wrap_shell_command(
+                command,
+                self.workspace,
+            )
+            shell = False
+        else:
+            command_or_argv = command
+            shell = True
         try:
             completed = subprocess.run(
-                argv,
+                command_or_argv,
                 cwd=self.workspace,
-                shell=False,
+                shell=shell,
                 text=True,
                 capture_output=True,
                 timeout=float(timeout),
