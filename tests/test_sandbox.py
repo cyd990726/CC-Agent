@@ -1,3 +1,4 @@
+import os
 import subprocess
 import tempfile
 import unittest
@@ -10,6 +11,8 @@ from agent.sandbox import (
     SandboxConfig,
     SandboxError,
     SandboxManager,
+    choose_backend,
+    shell_command_argv,
 )
 from tools.shell import ShellTool
 
@@ -36,7 +39,29 @@ class SandboxTests(unittest.TestCase):
 
             argv = manager.wrap_shell_command("echo hello", Path(directory))
 
-        self.assertEqual(argv[-2:], ["-lc", "echo hello"])
+        if os.name == "nt":
+            self.assertEqual(argv[-4:], ["/d", "/s", "/c", "echo hello"])
+        else:
+            self.assertEqual(argv[-2:], ["-lc", "echo hello"])
+
+    def test_shell_command_argv_uses_cmd_on_windows(self) -> None:
+        with patch("agent.sandbox.os.name", "nt"), patch.dict(
+            "agent.sandbox.os.environ",
+            {"COMSPEC": r"C:\Windows\System32\cmd.exe"},
+        ):
+            argv = shell_command_argv("echo hello")
+
+        self.assertEqual(
+            argv,
+            [r"C:\Windows\System32\cmd.exe", "/d", "/s", "/c", "echo hello"],
+        )
+
+    def test_unsupported_platform_fails_closed_when_sandbox_enabled(self) -> None:
+        backend = choose_backend("Windows")
+        manager = SandboxManager(SandboxConfig(enabled=True), backend=backend)
+
+        with self.assertRaisesRegex(SandboxError, "unavailable"):
+            manager.wrap_shell_command("echo hello", Path.cwd())
 
     def test_enabled_sandbox_uses_backend(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

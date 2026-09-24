@@ -45,7 +45,17 @@ class NoopSandboxBackend:
         return True
 
     def wrap(self, command: str, *, cwd: Path, config: SandboxConfig) -> list[str]:
-        return [shell_path(), "-lc", command]
+        return shell_command_argv(command)
+
+
+class UnsupportedSandboxBackend:
+    name = "unsupported"
+
+    def available(self) -> bool:
+        return False
+
+    def wrap(self, command: str, *, cwd: Path, config: SandboxConfig) -> list[str]:
+        raise SandboxError("sandbox is enabled but this platform is unsupported")
 
 
 class BubblewrapSandboxBackend:
@@ -160,11 +170,19 @@ def choose_backend(system: str | None = None) -> SandboxBackend:
         return BubblewrapSandboxBackend()
     if platform_name == "darwin":
         return MacOSSandboxExecBackend()
-    return NoopSandboxBackend()
+    return UnsupportedSandboxBackend()
 
 
 def shell_path() -> str:
+    if os.name == "nt":
+        return os.environ.get("COMSPEC") or "cmd.exe"
     return os.environ.get("SHELL") or "/bin/sh"
+
+
+def shell_command_argv(command: str) -> list[str]:
+    if os.name == "nt":
+        return [shell_path(), "/d", "/s", "/c", command]
+    return [shell_path(), "-lc", command]
 
 
 def sandbox_temp_dir() -> Path:
