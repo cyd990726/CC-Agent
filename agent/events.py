@@ -18,6 +18,7 @@ class EventType(str, Enum):
     TOOL_COMPLETED = "tool_completed"
     RUN_COMPLETED = "run_completed"
     RUN_FAILED = "run_failed"
+    RUN_CANCELLED = "run_cancelled"
 
 
 @dataclass(frozen=True)

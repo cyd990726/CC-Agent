@@ -1,12 +1,16 @@
 """Shell command tool."""
 
 import json
+import os
+import signal
 import subprocess
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from agent.sandbox import SandboxManager
+from agent.cancellation import current_token
 from tools.base import Tool, ToolError, require_string
 
 
@@ -52,12 +56,16 @@ class ShellTool(Tool):
             command_or_argv = command
             shell = True
         try:
+            token = current_token.get()
+            if token is not None:
+                return self._run_cancellable(command_or_argv, shell, float(timeout), token)
             completed = subprocess.run(
                 command_or_argv,
                 cwd=self.workspace,
                 shell=shell,
                 text=True,
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
                 timeout=float(timeout),
                 check=False,
             )
@@ -71,3 +79,63 @@ class ShellTool(Tool):
             },
             ensure_ascii=False,
         )
+
+    def _run_cancellable(self, command, shell, timeout, token):
+        token.check()
+        process = subprocess.Popen(
+            command, cwd=self.workspace, shell=shell, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            start_new_session=os.name != "nt",
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        )
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                token.check()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.05, remaining))
+                    token.check()
+                    return json.dumps({
+                        "exit_code": process.returncode,
+                        "stdout": stdout, "stderr": stderr,
+                    }, ensure_ascii=False)
+                except subprocess.TimeoutExpired:
+                    continue
+        finally:
+            # A shell can exit before descendants that still hold its pipes.
+            # Terminate the group even if poll() already reports shell exit.
+            if (process.poll() is None or token.event.is_set()
+                    or time.monotonic() >= deadline):
+                self._terminate_tree(process)
+
+    @staticmethod
+    def _terminate_tree(process):
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=5, check=False,
+            )
+        else:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(process.pid, sig)
+                except ProcessLookupError:
+                    break
+                if sig == signal.SIGTERM:
+                    try:
+                        process.wait(timeout=0.2)
+                    except subprocess.TimeoutExpired:
+                        pass
+        try:
+            process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
+        finally:
+            process.stdout.close()
+            process.stderr.close()

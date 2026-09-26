@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from agent.events import AgentEvent, EventType
+from agent.cancellation import CancellationToken, RunCancelled, check_cancelled
 from agent.permissions import PermissionMode
 from agent.prompt import build_system_prompt
 from agent.state import AgentState
@@ -71,6 +72,21 @@ class AgentRuntime:
         task: str,
         *,
         on_event: Callable[[AgentEvent], None] | None = None,
+        cancellation: CancellationToken | None = None,
+    ) -> AgentState:
+        token = cancellation or CancellationToken()
+        try:
+            with token.bind():
+                return self._run(task, on_event=on_event)
+        except RunCancelled:
+            self._emit(on_event, EventType.RUN_CANCELLED)
+            raise
+
+    def _run(
+        self,
+        task: str,
+        *,
+        on_event: Callable[[AgentEvent], None] | None = None,
     ) -> AgentState:
         task = task.strip()
         if not task:
@@ -91,6 +107,7 @@ class AgentRuntime:
 
         try:
             for _ in range(self.max_steps):
+                check_cancelled()
                 self._emit(
                     on_event,
                     EventType.MODEL_STARTED,
@@ -105,6 +122,7 @@ class AgentRuntime:
                             delta=delta,
                         ),
                     )
+                    check_cancelled()
                     state.steps += 1
                     response = self._normalize_response(response)
                     self._record_model_response(state, response)
@@ -215,6 +233,7 @@ class AgentRuntime:
                     args=event_args,
                 )
                 result = self.tools.execute(tool_name, args)
+                check_cancelled()
                 state.tool_results.append(result)
                 self._emit(
                     on_event,
@@ -230,6 +249,8 @@ class AgentRuntime:
                 )
 
             raise MaxStepsExceeded(state)
+        except RunCancelled:
+            raise
         except Exception as exc:
             self._emit(
                 on_event,

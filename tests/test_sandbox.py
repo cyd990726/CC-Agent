@@ -147,6 +147,7 @@ class SandboxTests(unittest.TestCase):
         self.assertIn('"stdout": "hi\\n"', output)
         _, kwargs = run.call_args
         self.assertEqual(kwargs["shell"], False)
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(run.call_args.args[0], ["/fake-sandbox", "echo hi"])
 
     def test_shell_tool_uses_native_shell_when_sandbox_disabled(self) -> None:
@@ -163,6 +164,7 @@ class SandboxTests(unittest.TestCase):
         self.assertIn('"stdout": "hi\\n"', output)
         self.assertEqual(run.call_args.args[0], "echo hi")
         self.assertTrue(run.call_args.kwargs["shell"])
+        self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

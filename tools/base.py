@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent.permissions import PermissionMode
+from agent.cancellation import RunCancelled, check_cancelled
 
 
 READ_ONLY_TOOL_NAMES = frozenset(
@@ -109,6 +110,7 @@ class ToolExecutor:
             set_mode(mode)
 
     def execute(self, tool_name: str, args: Mapping[str, Any]) -> ToolResult:
+        check_cancelled()
         if self._allowed_tools is not None and tool_name not in self._allowed_tools:
             return ToolResult(
                 tool_name,
@@ -143,6 +145,7 @@ class ToolExecutor:
                 allowed = self._permission_handler(tool_name, args)
             except EOFError:
                 allowed = False
+            check_cancelled()
             if not allowed:
                 return ToolResult(
                     tool_name,
@@ -156,8 +159,11 @@ class ToolExecutor:
         if temporary_access:
             tool.set_temporary_full_access(True)
         try:
+            check_cancelled()
             output = tool.run(args)
             return ToolResult(tool_name, dict(args), True, str(output))
+        except RunCancelled:
+            raise
         except Exception as exc:  # A failed action is data the model can recover from.
             return ToolResult(
                 tool_name, dict(args), False, f"{type(exc).__name__}: {exc}"
