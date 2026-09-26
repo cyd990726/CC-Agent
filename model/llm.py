@@ -10,6 +10,9 @@ from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from agent.cancellation import current_token, check_cancelled
+from model.transport import cancellable_response
+
 
 class ModelError(RuntimeError):
     """Raised when a model request or response is invalid."""
@@ -92,11 +95,23 @@ class ChatCompletionsLLM(LLM):
     ) -> Mapping[str, Any]:
         """Consume an OpenAI-compatible SSE stream and return its full JSON."""
 
+        token = current_token.get()
+        if token is not None:
+            deliver = (
+                (lambda delta: token.deliver(on_delta, delta))
+                if on_delta is not None else None
+            )
+            return token.run_io(lambda: self._stream_chat(messages, deliver))
+        return self._stream_chat(messages, on_delta)
+
+    def _stream_chat(self, messages, on_delta=None):
+
         payload = self._make_payload(messages, stream=True)
         chunks: list[str] = []
 
         def consume(response: Any) -> None:
             for raw_line in response:
+                check_cancelled()
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line or line.startswith(":") or not line.startswith("data:"):
                     continue
@@ -155,14 +170,23 @@ class ChatCompletionsLLM(LLM):
         )
 
         for attempt in range(self.max_retries + 1):
+            check_cancelled()
             self._wait_for_rate_limit()
             self._request_times.append(time.monotonic())
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                token = current_token.get()
+                response_context = (
+                    cancellable_response(request, self.timeout, token)
+                    if token is not None
+                    else urllib.request.urlopen(request, timeout=self.timeout)
+                )
+                with response_context as response:
                     consume(response)
+                    check_cancelled()
                 return
             except urllib.error.HTTPError as exc:
                 try:
+                    check_cancelled()
                     detail = exc.read().decode("utf-8", errors="replace")
                 finally:
                     exc.close()
@@ -176,13 +200,22 @@ class ChatCompletionsLLM(LLM):
                         )
                         # The rejected request did not consume provider capacity.
                         self._request_times.pop()
-                    time.sleep(self._retry_delay(exc, detail, attempt))
+                    self._sleep(self._retry_delay(exc, detail, attempt))
                     continue
                 raise ModelError(
                     f"model request failed with HTTP {exc.code}: {detail}"
                 ) from exc
             except urllib.error.URLError as exc:
+                check_cancelled()
                 raise ModelError(f"model request failed: {exc.reason}") from exc
+
+    @staticmethod
+    def _sleep(seconds: float) -> None:
+        token = current_token.get()
+        if token is None:
+            time.sleep(seconds)
+        else:
+            token.wait(seconds)
 
     def _wait_for_rate_limit(self) -> None:
         """Keep request starts inside the provider's rolling one-minute quota."""
@@ -190,13 +223,14 @@ class ChatCompletionsLLM(LLM):
         if self.max_rpm is None:
             return
         while True:
+            check_cancelled()
             now = time.monotonic()
             cutoff = now - 60.0
             while self._request_times and self._request_times[0] <= cutoff:
                 self._request_times.popleft()
             if len(self._request_times) < self.max_rpm:
                 return
-            time.sleep(max(0.0, self._request_times[0] + 60.0 - now))
+            self._sleep(max(0.0, self._request_times[0] + 60.0 - now))
 
     @staticmethod
     def _detect_max_rpm(detail: str) -> int | None:

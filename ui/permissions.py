@@ -11,10 +11,9 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
-from rich import box
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
+from rich.console import Console, Group
+from rich.padding import Padding
+from rich.rule import Rule
 from rich.text import Text
 
 from agent.permissions import PermissionMode
@@ -22,16 +21,30 @@ from agent.permissions import PermissionMode
 
 PERMISSION_OPTIONS = (
     ("y", "允许一次", "仅执行这一次"),
-    ("a", "本次会话", "后续同类操作不再询问"),
+    ("a", "本次会话始终允许", "后续所有同名工具调用不再询问"),
     ("n", "拒绝", "不执行此操作"),
 )
+
+PERMISSION_LABELS = {
+    "edit_file": "修改文件", "write_file": "写入文件", "shell": "执行命令",
+    "web_search": "搜索网络", "fetch_url": "访问网页",
+}
+
+
+def permission_choices(tool_name: str):
+    """Describe the actual tool-wide scope of a session approval."""
+    return (
+        ("y", "允许一次", "仅执行当前操作"),
+        ("a", "本次会话始终允许", f"允许本会话所有 {tool_name} 调用"),
+        ("n", "拒绝", "不执行当前操作"),
+    )
 
 PERMISSION_STYLE = Style.from_dict(
     {
         "option": "#d4d4d8",
         "option.description": "#71717a",
-        "option.cursor": "#22d3ee bold",
-        "option.selected": "bg:#164e63 #ecfeff bold",
+        "option.cursor": "#d7a582 bold",
+        "option.selected": "#d7a582 bold",
         "help": "#71717a",
         "help.key": "#a1a1aa bold",
     }
@@ -57,7 +70,25 @@ class SessionPermissionHandler:
         self.workspace = workspace.resolve() if workspace is not None else None
         self.mode = mode
         self.allowed_for_session: set[str] = set()
+        self._uses_default_prompt = ask is None
         self._ask = ask or self._prompt
+        self._request_callback: (
+            Callable[[str, Mapping[str, Any]], str] | None
+        ) = None
+
+    def set_prompt_callback(self, ask: Callable[[str], str]) -> None:
+        """Route interactive approval through an owning terminal UI."""
+
+        if self._uses_default_prompt:
+            self._ask = ask
+
+    def set_request_callback(
+        self,
+        callback: Callable[[str, Mapping[str, Any]], str] | None,
+    ) -> None:
+        """Route the complete permission request into an owning UI."""
+
+        self._request_callback = callback
 
     def set_mode(self, mode: PermissionMode) -> None:
         self.mode = mode
@@ -81,8 +112,11 @@ class SessionPermissionHandler:
         ):
             return True
 
-        self._render_request(tool_name, args)
-        answer = self._ask("选择权限")
+        if self._request_callback is not None:
+            answer = self._request_callback(tool_name, args)
+        else:
+            self._render_request(tool_name, args)
+            answer = self._ask("选择权限")
         normalized = answer.strip().lower()
         if normalized in {"a", "always"}:
             self.allowed_for_session.add(tool_name)
@@ -225,7 +259,7 @@ class SessionPermissionHandler:
                         ),
                         (
                             "class:option.selected" if active else "class:option",
-                            f" {label:<8} ",
+                            f"{index + 1}. {label}",
                         ),
                         ("class:option.description", f"  {description}"),
                         ("", "\n" if index < len(PERMISSION_OPTIONS) - 1 else ""),
@@ -280,6 +314,10 @@ class SessionPermissionHandler:
             bindings.add(key)(
                 lambda event, value=key: event.app.exit(result=value)
             )
+        for index, (value, _label, _description) in enumerate(PERMISSION_OPTIONS, 1):
+            bindings.add(str(index))(
+                lambda event, answer=value: event.app.exit(result=answer)
+            )
 
         application = Application(
             layout=Layout(
@@ -301,36 +339,29 @@ class SessionPermissionHandler:
         return application.run()
 
     def _render_request(self, tool_name: str, args: Mapping[str, Any]) -> None:
-        labels = {
-            "edit_file": "修改文件",
-            "write_file": "写入文件",
-            "shell": "执行命令",
-            "web_search": "搜索网络",
-            "fetch_url": "访问网页",
-        }
-        details = Table.grid(padding=(0, 2))
-        details.add_column(style="bright_black", justify="right", no_wrap=True)
-        details.add_column(style="white", overflow="fold")
+        self.console.print()
+        self.console.print(self.request_panel(tool_name, args))
+
+    def request_panel(self, tool_name: str, args: Mapping[str, Any]) -> Group:
+        """Build the same approval preview for standalone and unified UIs."""
+        body = []
+        names = {"path": "文件", "url": "网址", "query": "搜索", "cwd": "目录",
+                 "timeout": "超时"}
         for name, value in args.items():
             if name in {"content", "old_text", "new_text"}:
                 continue
-            details.add_row(Text(name, style="bright_black"), Text(str(value)))
-
-        body = Table.grid()
-        body.add_row(Text(labels.get(tool_name, tool_name), style="bold"))
-        body.add_row(details)
+            if name == "command":
+                body.append(Text("$ " + str(value), style="bold", overflow="fold"))
+            else:
+                body.append(Text.assemble(
+                    (names.get(name, name) + "  ", "bright_black"), str(value)))
         preview = self._change_preview(tool_name, args)
         if preview:
-            body.add_row(self._style_diff(preview))
-        self.console.print()
-        self.console.print(
-            Panel.fit(
-                body,
-                title="[bold yellow] 权限确认 [/]",
-                border_style="bright_black",
-                box=box.ROUNDED,
-                padding=(0, 2),
-            )
+            body.extend((Text(""), self._style_diff(preview)))
+        return Group(
+            Rule(Text(f"权限确认 · {PERMISSION_LABELS.get(tool_name, tool_name)}",
+                      style="bold #d7a582"), style="#725844", align="left"),
+            Padding(Group(*body), (1, 2)),
         )
 
     def _change_preview(self, tool_name: str, args: Mapping[str, Any]) -> str:
@@ -386,7 +417,7 @@ class SessionPermissionHandler:
                 fromfile=f"a/{display_path}",
                 tofile=f"b/{display_path}",
             )
-            return "".join(diff)
+            return self._format_diff(diff)
 
         if tool_name != "write_file" or not isinstance(args.get("content"), str):
             return ""
@@ -426,19 +457,28 @@ class SessionPermissionHandler:
             fromfile=f"a/{display_path}" if existed else "/dev/null",
             tofile=f"b/{display_path}",
         )
-        return "".join(diff)
+        return self._format_diff(diff)
 
     @staticmethod
     def _snippet_diff(old_text: str, new_text: str, path: str) -> str:
         old_lines = old_text.splitlines(keepends=True)
         new_lines = new_text.splitlines(keepends=True)
-        return "".join(
+        return SessionPermissionHandler._format_diff(
             difflib.unified_diff(
                 old_lines,
                 new_lines,
                 fromfile=f"a/{path} (snippet)",
                 tofile=f"b/{path} (snippet)",
             )
+        )
+
+    @staticmethod
+    def _format_diff(lines) -> str:
+        # difflib leaves unterminated source lines unterminated. Joining them
+        # directly would display '-before+after' as a single deleted line.
+        return "".join(
+            line if line.endswith("\n") else line + "\n\\ No newline at end of file\n"
+            for line in lines
         )
 
     @staticmethod
