@@ -8,7 +8,7 @@ from typing import Any
 from agent.events import AgentEvent, EventType
 from agent.memory import MemoryStore
 from agent.runtime import AgentRuntime, AgentRuntimeError, MaxStepsExceeded
-from model.llm import LLM, ModelProtocolError
+from model.llm import LLM, ModelProtocolError, TokenUsage
 from tools.base import Tool, ToolExecutor
 
 
@@ -23,11 +23,24 @@ class QueueLLM(LLM):
 
 
 class StreamingQueueLLM(QueueLLM):
-    def stream_chat(self, messages, on_delta=None):
+    def __init__(
+        self,
+        responses: list[Mapping[str, Any]],
+        usages: list[TokenUsage] | None = None,
+    ) -> None:
+        super().__init__(responses)
+        self.usages = iter(usages or [])
+
+    def stream_chat(self, messages, on_delta=None, on_usage=None):
         response = self.chat(messages)
         if on_delta is not None:
             on_delta('{"final_answer":"')
             on_delta(str(response["final_answer"]) + '"}')
+        if on_usage is not None:
+            try:
+                on_usage(next(self.usages))
+            except StopIteration:
+                pass
         return response
 
 
@@ -36,7 +49,7 @@ class ProtocolErrorThenQueueLLM(QueueLLM):
         super().__init__(responses)
         self.failures_remaining = 1
 
-    def stream_chat(self, messages, on_delta=None):
+    def stream_chat(self, messages, on_delta=None, on_usage=None):
         self.calls.append(list(messages))
         if self.failures_remaining:
             self.failures_remaining -= 1
@@ -308,6 +321,34 @@ class RuntimeTests(unittest.TestCase):
             if event.type is EventType.MODEL_DELTA
         ]
         self.assertEqual(deltas, ['{"final_answer":"', 'done"}'])
+
+    def test_accumulates_and_emits_model_token_usage(self) -> None:
+        events: list[AgentEvent] = []
+        model = StreamingQueueLLM(
+            [{"final_answer": "done"}],
+            usages=[TokenUsage(prompt_tokens=10, completion_tokens=3, total_tokens=13)],
+        )
+
+        state = AgentRuntime(model, ToolExecutor([])).run(
+            "test task", on_event=events.append
+        )
+
+        usage_events = [
+            event for event in events if event.type is EventType.MODEL_USAGE
+        ]
+        self.assertEqual(len(usage_events), 1)
+        self.assertEqual(
+            usage_events[0].data["usage"],
+            {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+        )
+        self.assertEqual(
+            state.token_usage,
+            {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+        )
+        completed = next(
+            event for event in events if event.type is EventType.RUN_COMPLETED
+        )
+        self.assertEqual(completed.data["usage"]["total_tokens"], 13)
 
     def test_emits_failure_event_when_step_limit_is_exceeded(self) -> None:
         events: list[AgentEvent] = []

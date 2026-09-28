@@ -12,6 +12,7 @@ class EventType(str, Enum):
     RUN_STARTED = "run_started"
     MODEL_STARTED = "model_started"
     MODEL_DELTA = "model_delta"
+    MODEL_USAGE = "model_usage"
     MODEL_COMPLETED = "model_completed"
     TOOL_REQUESTED = "tool_requested"
     TOOL_STARTED = "tool_started"

@@ -8,6 +8,7 @@ import urllib.request
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from agent.cancellation import current_token, check_cancelled
@@ -20,6 +21,39 @@ class ModelError(RuntimeError):
 
 class ModelProtocolError(ModelError):
     """Raised when model content does not follow the agent JSON protocol."""
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    """Token usage reported by an OpenAI-compatible provider."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    @classmethod
+    def from_api(cls, payload: Any) -> "TokenUsage | None":
+        if not isinstance(payload, Mapping):
+            return None
+        prompt_tokens = _non_negative_int(payload.get("prompt_tokens"))
+        completion_tokens = _non_negative_int(payload.get("completion_tokens"))
+        total_tokens = _non_negative_int(payload.get("total_tokens"))
+        if total_tokens == 0:
+            total_tokens = prompt_tokens + completion_tokens
+        if prompt_tokens == 0 and completion_tokens == 0 and total_tokens == 0:
+            return None
+        return cls(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+        }
 
 
 # 抽象基类
@@ -35,6 +69,7 @@ class LLM(ABC):
         self,
         messages: Sequence[Mapping[str, str]],
         on_delta: Callable[[str], None] | None = None,
+        on_usage: Callable[[TokenUsage], None] | None = None,
     ) -> Mapping[str, Any]:
         """Return one response, optionally reporting content increments.
 
@@ -94,7 +129,11 @@ class ChatCompletionsLLM(LLM):
         self.max_rpm = max_rpm
         self._request_times: deque[float] = deque()
 
-    def chat(self, messages: Sequence[Mapping[str, str]]) -> Mapping[str, Any]:
+    def chat(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        on_usage: Callable[[TokenUsage], None] | None = None,
+    ) -> Mapping[str, Any]:
         payload = self._make_payload(messages, stream=False)
         body = self._send(payload).decode("utf-8")
 
@@ -105,12 +144,16 @@ class ChatCompletionsLLM(LLM):
             raise ModelError("model API returned an unexpected response") from exc
         if not isinstance(content, str):
             raise ModelError("model message content must be a string")
+        usage = TokenUsage.from_api(data.get("usage"))
+        if usage is not None and on_usage is not None:
+            on_usage(usage)
         return parse_json_object(content)
 
     def stream_chat(
         self,
         messages: Sequence[Mapping[str, str]],
         on_delta: Callable[[str], None] | None = None,
+        on_usage: Callable[[TokenUsage], None] | None = None,
     ) -> Mapping[str, Any]:
         """Consume an OpenAI-compatible SSE stream and return its full JSON."""
 
@@ -120,15 +163,23 @@ class ChatCompletionsLLM(LLM):
                 (lambda delta: token.deliver(on_delta, delta))
                 if on_delta is not None else None
             )
-            return token.run_io(lambda: self._stream_chat(messages, deliver))
-        return self._stream_chat(messages, on_delta)
+            deliver_usage = (
+                (lambda usage: token.deliver(on_usage, usage))
+                if on_usage is not None else None
+            )
+            return token.run_io(
+                lambda: self._stream_chat(messages, deliver, deliver_usage)
+            )
+        return self._stream_chat(messages, on_delta, on_usage)
 
-    def _stream_chat(self, messages, on_delta=None):
+    def _stream_chat(self, messages, on_delta=None, on_usage=None):
 
         payload = self._make_payload(messages, stream=True)
         chunks: list[str] = []
+        usage: TokenUsage | None = None
 
         def consume(response: Any) -> None:
+            nonlocal usage
             for raw_line in response:
                 check_cancelled()
                 line = raw_line.decode("utf-8", errors="replace").strip()
@@ -139,8 +190,17 @@ class ChatCompletionsLLM(LLM):
                     break
                 try:
                     event = json.loads(data_text)
-                    delta = event["choices"][0]["delta"].get("content")
-                except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+                except json.JSONDecodeError as exc:
+                    raise ModelError("model API returned an invalid stream event") from exc
+                event_usage = TokenUsage.from_api(event.get("usage"))
+                if event_usage is not None:
+                    usage = event_usage
+                try:
+                    choices = event.get("choices")
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {}).get("content")
+                except (AttributeError, IndexError, TypeError) as exc:
                     raise ModelError("model API returned an invalid stream event") from exc
                 if delta is None:
                     continue
@@ -153,6 +213,8 @@ class ChatCompletionsLLM(LLM):
         self._open_with_retries(payload, consume)
         if not chunks:
             raise ModelError("model API returned an empty stream")
+        if usage is not None and on_usage is not None:
+            on_usage(usage)
         return parse_json_object("".join(chunks))
 
     def _make_payload(
@@ -164,6 +226,7 @@ class ChatCompletionsLLM(LLM):
         }
         if stream:
             body["stream"] = True
+            body["stream_options"] = {"include_usage": True}
         return json.dumps(body).encode("utf-8")
 
     def _send(self, payload: bytes) -> bytes:
@@ -289,3 +352,11 @@ def parse_json_object(content: str) -> Mapping[str, Any]:
     if not isinstance(value, dict):
         raise ModelProtocolError("model response JSON must be an object")
     return value
+
+
+def _non_negative_int(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, number)

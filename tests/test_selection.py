@@ -45,6 +45,31 @@ class SelectionTests(unittest.TestCase):
         self.control._selection_fragments()
         self.assertIn("new output", str(self.control.rendered))
 
+    def test_selection_content_uses_lazy_line_highlighting(self):
+        lines = tuple((("", f"line {index}"),) for index in range(5000))
+        control = TranscriptSelectionControl(
+            lambda: [("", "unused")],
+            Mock(),
+            Mock(),
+            source_lines=lambda: lines,
+        )
+        control.create_content(80, 20)
+        control.mouse_handler(MouseEvent(
+            position=Point(x=0, y=10), event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT, modifiers=frozenset()))
+        control.mouse_handler(MouseEvent(
+            position=Point(x=4, y=12), event_type=MouseEventType.MOUSE_MOVE,
+            button=MouseButton.LEFT, modifiers=frozenset()))
+        control._selection_fragments = Mock(side_effect=AssertionError(
+            "selection should be rendered per line"
+        ))
+
+        content = control.create_content(80, 20)
+
+        self.assertEqual(content.line_count, len(lines))
+        self.assertTrue(any("reverse" in style for style, _text in content.get_line(11)))
+        control._selection_fragments.assert_not_called()
+
     def test_click_without_drag_does_not_copy(self):
         self.mouse(MouseEventType.MOUSE_DOWN, 2)
         self.mouse(MouseEventType.MOUSE_UP, 2)

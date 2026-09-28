@@ -77,6 +77,69 @@ class TerminalAppTests(unittest.TestCase):
         self.assertEqual(rendered.splitlines(), list(LOGO_LINES))
         self.assertIn("o.o", rendered)
 
+    def test_initial_transcript_line_cache_contains_header(self) -> None:
+        output = StringIO()
+        console = Console(file=output, force_terminal=False, width=80)
+        app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=Path("/tmp/example"),
+        )
+
+        app._reset_transcript_to_header()
+
+        rendered = "".join(
+            text
+            for line in app._transcript_line_fragments
+            for _style, text in line
+        )
+        self.assertIn("MINI AGENT", rendered)
+        self.assertIn("test-model", rendered)
+
+    def test_header_logo_animates_before_transcript_output(self) -> None:
+        output = StringIO()
+        console = Console(file=output, force_terminal=False, width=80)
+        app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=Path("/tmp/example"),
+        )
+        with patch("ui.terminal.time.monotonic", return_value=1.0):
+            app._reset_transcript_to_header()
+        before = "".join(app._transcript)
+        app._ui_active = True
+
+        with patch("ui.terminal.time.monotonic", return_value=1.4):
+            changed = app._advance_header_animation()
+
+        self.assertTrue(changed)
+        self.assertNotEqual("".join(app._transcript), before)
+
+    def test_header_logo_stops_animating_after_transcript_output(self) -> None:
+        output = StringIO()
+        console = Console(file=output, force_terminal=False, width=80)
+        app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=Path("/tmp/example"),
+        )
+        app._reset_transcript_to_header()
+        app._ui_active = True
+        app._append_renderables(("answer",))
+        before = "".join(app._transcript)
+
+        with patch("ui.terminal.time.monotonic", return_value=time.monotonic() + 1):
+            changed = app._advance_header_animation()
+
+        self.assertFalse(changed)
+        self.assertEqual("".join(app._transcript), before)
+
     def test_status_line_contains_model_and_workspace(self) -> None:
         output = StringIO()
         console = Console(file=output, force_terminal=False)
@@ -132,6 +195,39 @@ class TerminalAppTests(unittest.TestCase):
         self.assertNotIn(default_session_app.session.id, default_text)
         self.assertNotIn("temporary", temporary_text)
 
+    def test_activity_line_shows_session_token_usage_on_the_right(self) -> None:
+        output = StringIO()
+        console = Console(file=output, force_terminal=False)
+        workspace = Path("/tmp/example")
+        session = SessionRecord.new(workspace, title="Feature work")
+        session.turns = [
+            {
+                "task": "inspect",
+                "tools": [],
+                "usage": {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 250,
+                    "total_tokens": 1250,
+                },
+            }
+        ]
+        app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=workspace,
+            session=session,
+            prompt=lambda _message: "/exit",
+        )
+        fake_app = Mock()
+        fake_app.output.get_size.return_value.columns = 60
+
+        with patch("ui.terminal.get_app", return_value=fake_app):
+            rendered = "".join(text for _style, text in app._activity_fragments())
+
+        self.assertTrue(rendered.endswith(" 1.2k tokens "))
+
     def test_first_task_updates_session_title_before_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -161,6 +257,35 @@ class TerminalAppTests(unittest.TestCase):
         self.assertEqual(saved.title, "fix startup resume behavior")
         self.assertEqual(saved.tasks, ["fix startup resume behavior"])
 
+    def test_interactive_submit_does_not_save_session_on_enter_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = Path("/tmp/example")
+            store = SessionStore(workspace, root=root / "data")
+            session = store.draft()
+            store.save = Mock(side_effect=AssertionError("save should be deferred"))
+            console = Console(file=StringIO(), force_terminal=False)
+            app = TerminalApp(
+                Mock(spec=AgentRuntime),
+                TerminalRenderer(console),
+                console,
+                model_name="test-model",
+                workspace=workspace,
+                session_store=store,
+                session=session,
+            )
+            with create_pipe_input() as pipe_input:
+                application = app._create_application(input=pipe_input)
+            assert app._input_field is not None
+            app._input_field.text = "inspect files"
+
+            app._submit_input(app._input_field, application)
+
+        self.assertEqual(app._input_field.text, "")
+        self.assertEqual(app.history, ["inspect files"])
+        self.assertEqual(len(session.turns), 1)
+        self.assertEqual(app._task_queue.get_nowait().task, "inspect files")
+
     def test_tool_result_is_checkpointed_before_task_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -179,6 +304,21 @@ class TerminalAppTests(unittest.TestCase):
             )
             turn_index = app._record_task_submission("inspect files")
 
+            app._checkpoint_session_event(
+                "inspect files",
+                AgentEvent(
+                    EventType.MODEL_USAGE,
+                    {
+                        "step": 1,
+                        "usage": {
+                            "prompt_tokens": 12,
+                            "completion_tokens": 3,
+                            "total_tokens": 15,
+                        },
+                    },
+                ),
+                turn_index,
+            )
             app._checkpoint_session_event(
                 "inspect files",
                 AgentEvent(EventType.TOOL_STARTED, {"tool": "list_files"}),
@@ -211,6 +351,7 @@ class TerminalAppTests(unittest.TestCase):
         self.assertEqual(saved.turns[0]["status"], "running")
         self.assertEqual(saved.turns[0]["tools"][0]["tool"], "list_files")
         self.assertEqual(saved.turns[0]["tools"][0]["output"], "README.md")
+        self.assertEqual(saved.turns[0]["usage"]["total_tokens"], 15)
         self.assertEqual(saved.messages[0], {"role": "user", "content": "inspect files"})
         self.assertTrue(saved.messages[1]["content"].startswith("Observation:"))
         observation = json.loads(saved.messages[1]["content"].split("\n", 1)[1])
