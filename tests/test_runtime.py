@@ -1,9 +1,12 @@
 import json
+import tempfile
 import unittest
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from agent.events import AgentEvent, EventType
+from agent.memory import MemoryStore
 from agent.runtime import AgentRuntime, AgentRuntimeError, MaxStepsExceeded
 from model.llm import LLM, ModelProtocolError
 from tools.base import Tool, ToolExecutor
@@ -69,6 +72,34 @@ class RuntimeTests(unittest.TestCase):
         observation = model.calls[1][-1]["content"]
         self.assertTrue(observation.startswith("Observation:"))
         self.assertTrue(json.loads(observation.split("\n", 1)[1])["success"])
+
+    def test_run_can_continue_prior_session_messages(self) -> None:
+        model = QueueLLM([{"final_answer": "continued"}])
+        prior = [{"role": "user", "content": "previous task"}]
+
+        AgentRuntime(model, ToolExecutor([])).run(
+            "next task",
+            prior_messages=prior,
+        )
+
+        messages = model.calls[0]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[1], prior[0])
+        self.assertEqual(messages[-1]["content"], "next task")
+
+    def test_memory_is_injected_into_system_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            memory = MemoryStore(workspace, root=root / "data")
+            memory.append("Use unittest for this project.")
+            model = QueueLLM([{"final_answer": "done"}])
+
+            AgentRuntime(model, ToolExecutor([]), memory=memory).run("task")
+
+        self.assertIn("Persistent memory", model.calls[0][0]["content"])
+        self.assertIn("Use unittest for this project.", model.calls[0][0]["content"])
 
     def test_unknown_tool_is_returned_as_recoverable_observation(self) -> None:
         model = QueueLLM(

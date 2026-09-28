@@ -10,7 +10,15 @@ from agent.cancellation import RunCancelled, check_cancelled
 
 
 READ_ONLY_TOOL_NAMES = frozenset(
-    {"read_file", "find_files", "list_files", "search", "web_search", "fetch_url"}
+    {
+        "read_file",
+        "find_files",
+        "list_files",
+        "search",
+        "web_search",
+        "fetch_url",
+        "read_memory",
+    }
 )
 
 

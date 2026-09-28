@@ -80,6 +80,29 @@ class InteractionTests(unittest.TestCase):
         self.assertTrue(token.event.is_set())
         self.assertEqual(app._input_field.text, "draft")
 
+    def test_escape_cancels_busy_task_and_preserves_input_draft(self):
+        from prompt_toolkit.keys import Keys
+
+        app = self.make_app()
+        token = CancellationToken()
+        app._active_cancellation = token
+        with create_pipe_input() as pipe:
+            application = app._create_application(input=pipe, output=DummyOutput())
+        app._input_field.text = "draft"
+        event = Mock(app=application)
+
+        bindings = [
+            binding
+            for binding in application.key_bindings.get_bindings_for_keys(
+                (Keys.Escape,)
+            )
+            if binding.filter()
+        ]
+        bindings[-1].handler(event)
+
+        self.assertTrue(token.event.is_set())
+        self.assertEqual(app._input_field.text, "draft")
+
     def make_app(self, width=80):
         console = Console(file=StringIO(), width=width, force_terminal=False)
         runtime = Mock(spec=AgentRuntime)
