@@ -9,6 +9,7 @@ from agent.cancellation import CancellationToken, RunCancelled, check_cancelled
 from agent.permissions import PermissionMode
 from agent.prompt import build_system_prompt
 from agent.state import AgentState
+from agent.memory import MemoryStore
 from model.llm import LLM, ModelProtocolError
 from tools.base import ToolExecutor
 
@@ -41,6 +42,7 @@ class AgentRuntime:
         plan_mode: bool = False,
         permission_mode: PermissionMode = PermissionMode.ASK,
         protocol_retries: int = 2,
+        memory: MemoryStore | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
@@ -54,6 +56,7 @@ class AgentRuntime:
         self.set_plan_mode(plan_mode)
         self.permission_mode = PermissionMode.ASK
         self.set_permission_mode(permission_mode)
+        self.memory = memory
 
     def set_plan_mode(self, enabled: bool) -> None:
         """Enable read-only planning or restore the full tool set."""
@@ -72,13 +75,18 @@ class AgentRuntime:
         self,
         task: str,
         *,
+        prior_messages: list[dict[str, str]] | None = None,
         on_event: Callable[[AgentEvent], None] | None = None,
         cancellation: CancellationToken | None = None,
     ) -> AgentState:
         token = cancellation or CancellationToken()
         try:
             with token.bind():
-                return self._run(task, on_event=on_event)
+                return self._run(
+                    task,
+                    prior_messages=prior_messages,
+                    on_event=on_event,
+                )
         except RunCancelled:
             self._emit(on_event, EventType.RUN_CANCELLED)
             raise
@@ -87,6 +95,7 @@ class AgentRuntime:
         self,
         task: str,
         *,
+        prior_messages: list[dict[str, str]] | None = None,
         on_event: Callable[[AgentEvent], None] | None = None,
     ) -> AgentState:
         task = task.strip()
@@ -94,14 +103,22 @@ class AgentRuntime:
             raise ValueError("task cannot be empty")
 
         state = AgentState(current_task=task)
+        memory_section = self.memory.prompt_section() if self.memory is not None else None
         state.add_message(
             "system",
             build_system_prompt(
                 self.tools.describe(),
                 plan_mode=self.plan_mode,
                 permission_mode=self.permission_mode,
+                memory_section=memory_section,
             ),
         )
+        if prior_messages:
+            state.messages.extend(
+                dict(message)
+                for message in prior_messages
+                if message.get("role") != "system"
+            )
         state.add_message("user", task)
         self._emit(on_event, EventType.RUN_STARTED, task=task)
         protocol_errors = 0

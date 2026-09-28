@@ -14,6 +14,7 @@ from urllib.request import Request
 from tools.base import Tool, ToolExecutor
 from tools.discovery import FindFilesTool, ListFilesTool
 from tools.file import EditFileTool, ReadFileTool, WriteFileTool
+from tools.memory import ReadMemoryTool, RememberTool
 from tools.search import SearchTool
 from tools.shell import ShellTool
 from tools.web import (
@@ -253,6 +254,21 @@ class ToolTests(unittest.TestCase):
                 }
             ),
         )
+
+    def test_memory_tools_read_and_append_project_memory(self) -> None:
+        from agent.memory import MemoryStore
+
+        memory = MemoryStore(self.workspace, root=self.workspace / ".data")
+        executor = ToolExecutor([RememberTool(memory), ReadMemoryTool(memory)])
+
+        saved = executor.execute(
+            "remember", {"content": "Prefer focused regression tests."}
+        )
+        read = executor.execute("read_memory", {})
+
+        self.assertTrue(saved.success)
+        self.assertTrue(read.success)
+        self.assertIn("Prefer focused regression tests.", read.output)
 
     def test_fetch_url_extracts_html_and_ignores_scripts(self) -> None:
         class FakeResponse:

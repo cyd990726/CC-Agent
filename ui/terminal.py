@@ -1,6 +1,7 @@
 """Persistent terminal REPL for Mini Agent."""
 
 import asyncio
+import json
 import queue
 import threading
 import time
@@ -36,14 +37,17 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
 from rich import box
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from agent.runtime import AgentRuntime, AgentRuntimeError
+from agent.events import AgentEvent, EventType
+from agent.runtime import AgentRuntime, AgentRuntimeError, MaxStepsExceeded
 from agent.cancellation import CancellationToken, RunCancelled
+from agent.memory import MemoryStore
 from agent.permissions import PermissionMode
+from agent.session import SessionRecord, SessionStore
 from model.llm import ModelError
 from ui.permissions import (
     PERMISSION_LABELS, PERMISSION_OPTIONS, SessionPermissionHandler, permission_choices,
@@ -57,6 +61,12 @@ from ui.selection import TranscriptSelectionControl, copy_to_clipboard
 COMMANDS = (
     ("/plan", "切换只读计划模式"),
     ("/permissions", "调整工具权限级别"),
+    ("/new", "开始新的持久会话"),
+    ("/resume", "恢复最近或指定会话"),
+    ("/session", "查看当前会话"),
+    ("/sessions", "列出最近会话"),
+    ("/memories", "查看项目记忆"),
+    ("/remember", "保存一条项目记忆"),
     ("/clear", "清空终端"),
     ("/status", "查看当前配置"),
     ("/history", "查看本次会话任务"),
@@ -71,6 +81,13 @@ class _PermissionRequest:
     args: dict[str, Any]
     ready: threading.Event
     answer: str = "n"
+
+
+@dataclass(frozen=True)
+class _QueuedTask:
+    task: str
+    turn_index: int | None = None
+    recorded: bool = False
 
 
 class SlashCommandCompleter(Completer):
@@ -214,6 +231,7 @@ INPUT_STYLE = Style.from_dict(
         "session-status.model": "#22d3ee bold",
         "session-status.separator": "#3f3f46",
         "session-status.path": "#a78bfa",
+        "session-status.session": "#facc15",
         "session-status.activity": "#22d3ee",
         "session-status.mode.accept": "#4ade80 bold",
         "session-status.mode.danger": "#ef4444 bold",
@@ -230,6 +248,7 @@ INPUT_STYLE = Style.from_dict(
         "overlay.option": "#d4d4d8",
         "overlay.selected": "bg:#164e63 #ecfeff bold",
         "overlay.help": "#71717a",
+        "overlay.meta": "#71717a",
         "approval.border": "#725844",
         "approval.title": "#d7a582 bold",
         "approval.selected": "#d7a582 bold",
@@ -253,6 +272,9 @@ class TerminalApp:
         workspace: Path,
         plan_mode: bool = False,
         permission_handler: SessionPermissionHandler | None = None,
+        session_store: SessionStore | None = None,
+        session: SessionRecord | None = None,
+        memory: MemoryStore | None = None,
         prompt: Callable[[str], str] | None = None,
     ) -> None:
         self.runtime = runtime
@@ -262,14 +284,17 @@ class TerminalApp:
         self.workspace = workspace
         self.plan_mode = plan_mode
         self.permission_handler = permission_handler
+        self.session_store = session_store
+        self.session = session
+        self.memory = memory
         self._permission_mode_before_plan = (
             self._current_permission_mode() if plan_mode else None
         )
-        self.history: list[str] = []
+        self.history: list[str] = list(session.tasks) if session is not None else []
         self._input_history = InMemoryHistory()
         self._prompt = prompt
         self._uses_terminal_prompt = prompt is None
-        self._task_queue: queue.Queue[str | None] = queue.Queue()
+        self._task_queue: queue.Queue[_QueuedTask | None] = queue.Queue()
         self._permission_requests: queue.Queue[_PermissionRequest] = queue.Queue()
         self._state_lock = threading.Lock()
         self._pending_tasks = 0
@@ -282,10 +307,14 @@ class TerminalApp:
         self._transcript_styled: list[tuple[str, str]] = []
         self._transcript_lines = 1
         self._transcript_cursor_line: int | None = None
+        self._streaming_block_index: int | None = None
         self._active_permission: _PermissionRequest | None = None
         self._permission_selection = len(PERMISSION_OPTIONS) - 1
         self._mode_selector_open = False
         self._mode_selection = 0
+        self._resume_selector_open = False
+        self._resume_selection = 0
+        self._resume_candidates: list[SessionRecord] = []
         self._activity_message: str | None = None
         self._activity_started_at: float | None = None
         self._application: Application[Any] | None = None
@@ -323,8 +352,8 @@ class TerminalApp:
                     if self._handle_command(task):
                         break
                     continue
-                self.history.append(task)
-                self._enqueue_task(task)
+                turn_index = self._record_task_submission(task)
+                self._enqueue_task(task, turn_index=turn_index, recorded=True)
         finally:
             self._task_queue.put(None)
             worker.join()
@@ -343,6 +372,7 @@ class TerminalApp:
         self.renderer.set_activity_handler(self._update_activity)
         self.renderer.set_output_handler(self._write_transcript)
         self.renderer.set_render_handler(self._append_renderables)
+        self.renderer.set_stream_render_handler(self._update_streaming_renderables)
         if self.permission_handler is not None:
             self.permission_handler.set_request_callback(
                 self._request_permission
@@ -382,6 +412,7 @@ class TerminalApp:
             self.renderer.set_activity_handler(None)
             self.renderer.set_output_handler(None)
             self.renderer.set_render_handler(None)
+            self.renderer.set_stream_render_handler(None)
             if self.permission_handler is not None:
                 self.permission_handler.set_request_callback(None)
             self._application = None
@@ -408,23 +439,55 @@ class TerminalApp:
             request.ready.set()
             self._permission_requests.task_done()
 
-    def _enqueue_task(self, task: str) -> None:
+    def _enqueue_task(
+        self,
+        task: str,
+        *,
+        turn_index: int | None = None,
+        recorded: bool = False,
+    ) -> None:
         with self._state_lock:
             was_busy = self._pending_tasks > 0
             self._pending_tasks += 1
             position = self._pending_tasks
-        self._task_queue.put(task)
+        self._task_queue.put(_QueuedTask(task, turn_index, recorded))
         if was_busy:
             self._print_message(
                 f"[bright_black]  ↳ 已排队 · 第 {position} 个任务[/]"
             )
 
+    def _record_task_submission(self, task: str) -> int | None:
+        self.history.append(task)
+        if self.session is None or self.session_store is None:
+            return None
+        message_start = len(self.session.messages)
+        self.session.tasks = list(self.history)
+        self.session.turns.append(
+            {
+                "task": task,
+                "answer": None,
+                "tools": [],
+                "status": "queued",
+                "message_start": message_start,
+            }
+        )
+        self._append_session_message("user", task)
+        if self.session.title == "New session" and self.history:
+            self.session.title = self.history[0][:80]
+        turn_index = len(self.session.turns) - 1
+        try:
+            self.session_store.save(self.session)
+        except OSError as exc:
+            self._print_message(f"[yellow]会话保存失败：{exc}[/]")
+        return turn_index
+
     def _task_worker(self) -> None:
         while True:
-            task = self._task_queue.get()
-            if task is None:
+            item = self._task_queue.get()
+            if item is None:
                 self._task_queue.task_done()
                 return
+            task = item.task
             with self._state_lock:
                 cancellation = CancellationToken()
                 self._active_cancellation = cancellation
@@ -438,7 +501,12 @@ class TerminalApp:
                             (task, "default"),
                         )
                     )
-                self.run_task(task, cancellation=cancellation)
+                self.run_task(
+                    task,
+                    cancellation=cancellation,
+                    checkpoint_turn_index=item.turn_index,
+                    task_recorded=item.recorded,
+                )
             finally:
                 with self._state_lock:
                     self._active_cancellation = None
@@ -478,23 +546,301 @@ class TerminalApp:
         request.ready.wait()
         return request.answer
 
-    def run_task(self, task: str, *, cancellation=None) -> bool:
+    def run_task(
+        self,
+        task: str,
+        *,
+        cancellation=None,
+        checkpoint_turn_index: int | None = None,
+        task_recorded: bool = False,
+    ) -> bool:
+        checkpoint_turn_index = self._begin_task_checkpoint(
+            task,
+            checkpoint_turn_index,
+            task_recorded=task_recorded,
+        )
+        on_event = self._checkpointing_event_handler(task, checkpoint_turn_index)
         try:
-            self.runtime.run(task, on_event=self.renderer, cancellation=cancellation)
+            state = self.runtime.run(
+                task,
+                prior_messages=self._prior_messages_for_turn(
+                    checkpoint_turn_index,
+                    task,
+                ),
+                on_event=on_event,
+                cancellation=cancellation,
+            )
+            self._save_session(task, state, turn_index=checkpoint_turn_index)
             return True
+        except MaxStepsExceeded as exc:
+            self._save_session(task, exc.state, turn_index=checkpoint_turn_index)
+            self.renderer.close()
+            return False
         except RunCancelled:
             return False
         except KeyboardInterrupt:
+            self._mark_turn_terminal(
+                task,
+                "cancelled",
+                error="KeyboardInterrupt",
+                turn_index=checkpoint_turn_index,
+            )
             self.renderer.close()
             self._print_message("\n[bold yellow]当前任务已中断。[/]")
-        except (AgentRuntimeError, ModelError, OSError, ValueError):
+        except (AgentRuntimeError, ModelError, OSError, ValueError) as exc:
+            self._mark_turn_terminal(
+                task,
+                "failed",
+                error=f"{type(exc).__name__}: {exc}",
+                turn_index=checkpoint_turn_index,
+            )
             self.renderer.close()
         except Exception as exc:
             # Keep the queue consumer alive even if an adapter or UI callback
             # fails outside the runtime's normal error handling.
+            self._mark_turn_terminal(
+                task,
+                "failed",
+                error=f"{type(exc).__name__}: {exc}",
+                turn_index=checkpoint_turn_index,
+            )
             self.renderer.close()
             self._print_message(Text(f"任务异常：{type(exc).__name__}: {exc}", style="red"))
         return False
+
+    def _begin_task_checkpoint(
+        self,
+        task: str,
+        turn_index: int | None,
+        *,
+        task_recorded: bool = False,
+    ) -> int | None:
+        if self.session is None or self.session_store is None:
+            if not task_recorded:
+                self.history.append(task)
+            return None
+        turn = self._turn_at(turn_index)
+        if turn is None:
+            if not task_recorded:
+                self.history.append(task)
+            message_start = len(self.session.messages)
+            self.session.tasks = list(self.history)
+            self.session.turns.append(
+                {
+                    "task": task,
+                    "answer": None,
+                    "tools": [],
+                    "status": "running",
+                    "message_start": message_start,
+                }
+            )
+            self._append_session_message("user", task)
+            turn_index = len(self.session.turns) - 1
+        else:
+            turn["status"] = "running"
+            if "message_start" not in turn:
+                turn["message_start"] = self._message_start_for_task(task)
+        if self.session.title == "New session" and self.history:
+            self.session.title = self.history[0][:80]
+        self._save_current_session()
+        return turn_index
+
+    def _checkpointing_event_handler(
+        self,
+        task: str,
+        turn_index: int | None,
+    ) -> Callable[[AgentEvent], None]:
+        def handle(event: AgentEvent) -> None:
+            self._checkpoint_session_event(task, event, turn_index)
+            self.renderer(event)
+
+        return handle
+
+    def _checkpoint_session_event(
+        self,
+        task: str,
+        event: AgentEvent,
+        turn_index: int | None,
+    ) -> None:
+        if self.session is None or self.session_store is None:
+            return
+        turn = self._turn_at(turn_index)
+        if turn is None:
+            return
+        if event.type is EventType.TOOL_STARTED:
+            turn["status"] = "running"
+            turn["current_tool"] = str(event.data.get("tool", "unknown"))
+        elif event.type is EventType.MODEL_COMPLETED:
+            response = event.data.get("response")
+            if isinstance(response, Mapping) and (
+                "action" in response or "final_answer" in response
+            ):
+                self._append_session_message(
+                    "assistant",
+                    json.dumps(
+                        dict(response),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                )
+        elif event.type is EventType.TOOL_COMPLETED:
+            result = event.data.get("result")
+            if isinstance(result, Mapping):
+                tools = turn.setdefault("tools", [])
+                if not isinstance(tools, list):
+                    tools = []
+                    turn["tools"] = tools
+                tools.append(self._checkpoint_tool_result(result))
+                turn["status"] = "running"
+                turn.pop("current_tool", None)
+                self._append_session_message(
+                    "user",
+                    self._observation_message(result),
+                )
+        elif event.type is EventType.RUN_COMPLETED:
+            turn["status"] = "completed"
+            turn["answer"] = str(event.data.get("answer", "")).strip()
+            turn["steps"] = event.data.get("steps")
+            turn.pop("current_tool", None)
+        elif event.type is EventType.RUN_FAILED:
+            turn["status"] = "failed"
+            turn["error"] = str(event.data.get("error", "运行失败"))
+            turn.pop("current_tool", None)
+        elif event.type is EventType.RUN_CANCELLED:
+            turn["status"] = "cancelled"
+            turn["error"] = "cancelled"
+            turn.pop("current_tool", None)
+        else:
+            return
+        self._save_current_session()
+
+    def _prior_messages_for_turn(
+        self,
+        turn_index: int | None,
+        task: str,
+    ) -> list[dict[str, str]] | None:
+        if self.session is None:
+            return None
+        message_start = None
+        turn = self._turn_at(turn_index)
+        if turn is not None:
+            raw = turn.get("message_start")
+            if isinstance(raw, int) and raw >= 0:
+                message_start = min(raw, len(self.session.messages))
+        if message_start is None:
+            message_start = self._message_start_for_task(task)
+        return [dict(message) for message in self.session.messages[:message_start]]
+
+    def _message_start_for_task(self, task: str) -> int:
+        if self.session is None:
+            return 0
+        for index in range(len(self.session.messages) - 1, -1, -1):
+            message = self.session.messages[index]
+            if (
+                message.get("role") == "user"
+                and message.get("content") == task
+            ):
+                return index
+        return len(self.session.messages)
+
+    def _append_session_message(self, role: str, content: str) -> None:
+        if self.session is None:
+            return
+        message = {"role": role, "content": content}
+        if self.session.messages and self.session.messages[-1] == message:
+            return
+        self.session.messages.append(message)
+
+    @staticmethod
+    def _observation_message(result: Mapping[str, Any]) -> str:
+        return (
+            "Observation:\n"
+            + json.dumps(
+                dict(result),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+
+    @staticmethod
+    def _checkpoint_tool_result(result: Mapping[str, Any]) -> dict[str, Any]:
+        args = result.get("args", {})
+        return {
+            "tool": str(result.get("tool", "unknown")),
+            "success": bool(result.get("success")),
+            "args": dict(args) if isinstance(args, Mapping) else {},
+            "output": TerminalApp._truncate_text(str(result.get("output", "")), 4000),
+        }
+
+    @staticmethod
+    def _truncate_text(text: str, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1] + "…"
+
+    def _turn_at(self, turn_index: int | None) -> dict[str, Any] | None:
+        if self.session is None or turn_index is None:
+            return None
+        if turn_index < 0 or turn_index >= len(self.session.turns):
+            return None
+        turn = self.session.turns[turn_index]
+        return turn if isinstance(turn, dict) else None
+
+    def _mark_turn_terminal(
+        self,
+        task: str,
+        status: str,
+        *,
+        error: str,
+        turn_index: int | None,
+    ) -> None:
+        if self.session is None or self.session_store is None:
+            return
+        turn = self._turn_at(turn_index)
+        if turn is None:
+            turn_index = self._begin_task_checkpoint(task, None)
+            turn = self._turn_at(turn_index)
+        if turn is None:
+            return
+        turn["status"] = status
+        turn["error"] = error
+        turn.pop("current_tool", None)
+        self._save_current_session()
+
+    def _save_current_session(self) -> None:
+        if self.session is None or self.session_store is None:
+            return
+        try:
+            self.session_store.save(self.session)
+        except OSError as exc:
+            self._print_message(f"[yellow]会话保存失败：{exc}[/]")
+
+    def _save_session(self, task: str, state, *, turn_index: int | None = None) -> None:
+        if self.session is None or self.session_store is None:
+            return
+        if not self.history or self.history[-1] != task:
+            self.history.append(task)
+        self.session.messages = [
+            dict(message) for message in state.messages if message.get("role") != "system"
+        ]
+        self.session.tasks = list(self.history)
+        turn = self._turn_at(turn_index)
+        if turn is None:
+            self.session.turns.append({"task": task, "tools": []})
+            turn = self.session.turns[-1]
+        turn["task"] = task
+        turn["answer"] = state.final_answer
+        if state.tool_results:
+            turn["tools"] = [
+                self._checkpoint_tool_result(result.as_dict())
+                for result in state.tool_results
+            ]
+        if state.final_answer:
+            turn["status"] = "completed"
+        elif turn.get("status") not in {"failed", "cancelled"}:
+            turn["status"] = "running"
+        turn.pop("current_tool", None)
+        self._save_current_session()
 
     def _handle_command(self, command: str) -> bool:
         normalized = command.strip().lower()
@@ -549,6 +895,22 @@ class TerminalApp:
                             f"{self._permission_mode_label(mode)}。"
                             f"{'计划模式已关闭。' if plan_was_active else ''}[/]"
                         )
+        elif normalized == "/new":
+            self._start_new_session()
+        elif normalized == "/resume":
+            self._open_resume_selector()
+        elif normalized.startswith("/resume "):
+            _command, _separator, session_id = command.partition(" ")
+            self._resume_session(session_id.strip())
+        elif normalized == "/session":
+            self._show_session()
+        elif normalized == "/sessions":
+            self._show_sessions()
+        elif normalized == "/memories":
+            self._show_memories()
+        elif normalized.startswith("/remember"):
+            _command, _separator, content = command.partition(" ")
+            self._remember(content)
         elif normalized == "/clear":
             if self._selection_control is not None:
                 self._selection_control.clear_selection()
@@ -560,6 +922,7 @@ class TerminalApp:
                     self._transcript_styled.clear()
                     self._transcript_lines = 1
                     self._transcript_cursor_line = None
+                    self._streaming_block_index = None
                 if self._transcript_window is not None:
                     self._transcript_window.follow_bottom()
                 self._invalidate()
@@ -648,6 +1011,10 @@ class TerminalApp:
             )
         table.add_row("Tool output", "expanded" if self.renderer.verbose else "compact")
         table.add_row("Tasks", str(len(self.history)))
+        if self.session is not None:
+            table.add_row("Session", self.session.id)
+        if self.memory is not None:
+            table.add_row("Memory", self._display_path(self.memory.entrypoint))
         self._print_message(
             Panel.fit(
                 table,
@@ -655,6 +1022,238 @@ class TerminalApp:
                 border_style="bright_black",
                 box=box.ROUNDED,
             )
+        )
+
+    def _start_new_session(self) -> None:
+        if self.session_store is None:
+            self.session = None
+            self.history.clear()
+            self._print_message("[bright_black]已开始临时新会话。[/]")
+            return
+        self.session = self.session_store.draft()
+        self.history.clear()
+        self._print_message(
+            f"[bright_black]已开始新会话：{self.session.id}。[/]"
+        )
+
+    def _resume_session(self, session_id: str = "") -> None:
+        if self.session_store is None:
+            self._print_message("[bright_black]当前没有持久会话存储。[/]")
+            return
+        session = self.session_store.load(session_id) if session_id else None
+        if session is None:
+            self._print_message(f"[yellow]找不到会话：{session_id}[/]")
+            return
+        self._switch_session(session)
+
+    def _open_resume_selector(self) -> None:
+        if self.session_store is None:
+            self._print_message("[bright_black]当前没有持久会话存储。[/]")
+            return
+        sessions = self.session_store.list(limit=10)
+        if not sessions:
+            self._print_message("[bright_black]还没有保存过会话。[/]")
+            return
+        self._resume_candidates = sessions
+        current_id = self.session.id if self.session is not None else None
+        self._resume_selection = next(
+            (
+                index
+                for index, session in enumerate(sessions)
+                if session.id == current_id
+            ),
+            0,
+        )
+        if self._ui_active:
+            self._resume_selector_open = True
+            if self._selection_control is not None:
+                self._selection_control.clear_selection()
+            self._copy_notice = ""
+            self._invalidate()
+            return
+        self._show_sessions()
+        self._print_message("[bright_black]使用 /resume <session-id> 恢复会话。[/]")
+
+    def _confirm_resume_selection(self) -> None:
+        if not self._resume_candidates:
+            self._close_resume_selector()
+            return
+        session = self._resume_candidates[self._resume_selection]
+        self._close_resume_selector()
+        self._switch_session(session)
+
+    def _close_resume_selector(self) -> None:
+        self._resume_selector_open = False
+        self._resume_candidates = []
+        self._resume_selection = 0
+
+    def _switch_session(self, session: SessionRecord) -> None:
+        self.session = session
+        self.history = list(session.tasks)
+        self._render_session_history(session)
+        self._print_message(
+            f"[bright_black]已恢复会话：{session.id} · "
+            f"{len(session.tasks)} 个任务。[/]"
+        )
+
+    def _render_session_history(self, session: SessionRecord) -> None:
+        history = self._session_history_renderable(session)
+        if not self._ui_active:
+            self._print_message(history)
+            return
+        self._refresh_header_frame()
+        header_block = TranscriptBlock((self._header_content(),))
+        header_text = header_block.render(
+            self._transcript_width,
+            self.console.color_system,
+        )
+        header_styled = list(to_formatted_text(ANSI(header_text)))
+        with self._state_lock:
+            self._transcript = [header_text]
+            self._transcript_blocks = [header_block]
+            self._transcript_styled = header_styled
+            self._transcript_lines = self._fragment_line_count(header_styled)
+            self._transcript_cursor_line = None
+            self._streaming_block_index = None
+        if self._transcript_window is not None:
+            self._transcript_window.follow_bottom()
+        self._append_renderables((history,))
+
+    def _session_history_renderable(self, session: SessionRecord) -> Panel:
+        rows: list[Any] = []
+        turns = session.turns or [
+            {"task": task, "answer": None, "tools": []}
+            for task in session.tasks
+        ]
+        if not turns:
+            rows.append(Text("这个会话还没有任务。", style="bright_black"))
+        for index, turn in enumerate(turns, 1):
+            task = str(turn.get("task") or "(empty task)")
+            answer = turn.get("answer")
+            tools = turn.get("tools") if isinstance(turn.get("tools"), list) else []
+            status = str(turn.get("status") or ("completed" if answer else "saved"))
+            current_tool = turn.get("current_tool")
+            error = turn.get("error")
+            block = Text()
+            block.append(f"{index}. ", style="bright_black")
+            block.append("› ", style="bold bright_cyan")
+            block.append(task)
+            if status != "completed":
+                block.append(f"\n   status: {status}", style="bright_black")
+                if isinstance(current_tool, str) and current_tool:
+                    block.append(f" · running {current_tool}", style="bright_black")
+            if tools:
+                succeeded = sum(
+                    1
+                    for tool in tools
+                    if isinstance(tool, dict) and tool.get("success")
+                )
+                last_tool = next(
+                    (
+                        tool
+                        for tool in reversed(tools)
+                        if isinstance(tool, dict)
+                    ),
+                    None,
+                )
+                last_label = ""
+                if last_tool is not None:
+                    tool_name = str(last_tool.get("tool", "unknown"))
+                    outcome = "ok" if last_tool.get("success") else "failed"
+                    last_label = f" · last {tool_name} {outcome}"
+                block.append(
+                    f"\n   tools: {succeeded}/{len(tools)} succeeded{last_label}",
+                    style="bright_black",
+                )
+            if isinstance(error, str) and error.strip():
+                block.append("\n   error: ", style="bright_black")
+                block.append(error.strip(), style="red")
+            rows.append(block)
+            if isinstance(answer, str) and answer.strip():
+                rows.append(
+                    Group(*self.renderer.answer_renderables(answer.strip()))
+                )
+            rows.append(Text(""))
+        if rows and isinstance(rows[-1], Text) and not rows[-1].plain:
+            rows.pop()
+        return Panel.fit(
+            Group(*rows),
+            title=f"[bold]Session {session.id}[/]",
+            border_style="bright_black",
+            box=box.ROUNDED,
+        )
+
+    def _show_session(self) -> None:
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column(style="bright_black")
+        table.add_column()
+        if self.session is None:
+            table.add_row("Session", "temporary")
+        else:
+            table.add_row("ID", self.session.id)
+            table.add_row("Title", self.session.title)
+            table.add_row("Created", self.session.created_at)
+            table.add_row("Updated", self.session.updated_at)
+            table.add_row("Messages", str(len(self.session.messages)))
+            table.add_row("Tasks", str(len(self.session.tasks)))
+        if self.session_store is not None:
+            table.add_row("Store", self._display_path(self.session_store.directory))
+        self._print_message(
+            Panel.fit(table, title="[bold]Session[/]", border_style="bright_black")
+        )
+
+    def _show_sessions(self) -> None:
+        if self.session_store is None:
+            self._print_message("[bright_black]当前没有持久会话存储。[/]")
+            return
+        sessions = self.session_store.list(limit=10)
+        if not sessions:
+            self._print_message("[bright_black]还没有保存过会话。[/]")
+            return
+        table = Table(box=None, padding=(0, 2))
+        table.add_column("ID", style="bright_cyan")
+        table.add_column("Updated", style="bright_black")
+        table.add_column("Tasks")
+        table.add_column("Title")
+        for item in sessions:
+            marker = "*" if self.session is not None and item.id == self.session.id else ""
+            table.add_row(
+                item.id + marker,
+                item.updated_at,
+                str(len(item.tasks)),
+                item.title,
+            )
+        self._print_message(
+            Panel.fit(table, title="[bold]Recent Sessions[/]", border_style="bright_black")
+        )
+
+    def _show_memories(self) -> None:
+        if self.memory is None:
+            self._print_message("[bright_black]当前没有启用项目记忆。[/]")
+            return
+        content = self.memory.read().strip() or "No memories have been saved yet."
+        self._print_message(
+            Panel.fit(
+                Text(content),
+                title=f"[bold]{self._display_path(self.memory.entrypoint)}[/]",
+                border_style="bright_black",
+            )
+        )
+
+    def _remember(self, content: str) -> None:
+        if self.memory is None:
+            self._print_message("[yellow]当前没有启用项目记忆。[/]")
+            return
+        if not content.strip():
+            self._print_message("[yellow]用法：/remember 要保存的内容[/]")
+            return
+        try:
+            self.memory.append(content)
+        except (OSError, ValueError) as exc:
+            self._print_message(f"[red]保存记忆失败：{exc}[/]")
+            return
+        self._print_message(
+            f"[bright_black]已保存记忆：{self._display_path(self.memory.entrypoint)}[/]"
         )
 
     @staticmethod
@@ -809,11 +1408,20 @@ class TerminalApp:
             ),
             filter=Condition(lambda: self._mode_selector_open),
         )
+        resume_overlay = ConditionalContainer(
+            content=Window(
+                content=FormattedTextControl(self._resume_fragments),
+                height=lambda: min(len(self._resume_candidates), 10) + 4,
+                style="class:overlay",
+            ),
+            filter=Condition(lambda: self._resume_selector_open),
+        )
         container = HSplit(
             [
                 transcript,
                 permission_overlay,
                 mode_overlay,
+                resume_overlay,
                 normal_bottom,
             ]
         )
@@ -835,6 +1443,7 @@ class TerminalApp:
             lambda: self._active_permission is not None
         )
         mode_visible = Condition(lambda: self._mode_selector_open)
+        resume_visible = Condition(lambda: self._resume_selector_open)
         completing = Condition(
             lambda: not self._overlay_visible() and self._has_completions(input_field)
         )
@@ -873,14 +1482,14 @@ class TerminalApp:
                 self._cycle_mode()
             event.app.invalidate()
 
-        @bindings.add("up", filter=permission_visible | mode_visible)
-        @bindings.add("left", filter=permission_visible | mode_visible)
+        @bindings.add("up", filter=permission_visible | mode_visible | resume_visible)
+        @bindings.add("left", filter=permission_visible | mode_visible | resume_visible)
         def select_previous(event) -> None:
             self._move_overlay(-1)
             event.app.invalidate()
 
-        @bindings.add("down", filter=permission_visible | mode_visible)
-        @bindings.add("right", filter=permission_visible | mode_visible)
+        @bindings.add("down", filter=permission_visible | mode_visible | resume_visible)
+        @bindings.add("right", filter=permission_visible | mode_visible | resume_visible)
         def select_next(event) -> None:
             self._move_overlay(1)
             event.app.invalidate()
@@ -892,6 +1501,8 @@ class TerminalApp:
                 self._resolve_permission(value)
             elif self._mode_selector_open:
                 self._confirm_mode()
+            elif self._resume_selector_open:
+                self._confirm_resume_selection()
             else:
                 state = input_field.buffer.complete_state
                 if state is not None and state.current_completion is not None:
@@ -899,12 +1510,14 @@ class TerminalApp:
                 self._submit_input(input_field, event.app)
             event.app.invalidate()
 
-        @bindings.add("escape", filter=permission_visible | mode_visible)
+        @bindings.add("escape", filter=permission_visible | mode_visible | resume_visible)
         def cancel_overlay(event) -> None:
             if self._active_permission is not None:
                 self._resolve_permission("n")
-            else:
+            elif self._mode_selector_open:
                 self._mode_selector_open = False
+            else:
+                self._close_resume_selector()
             event.app.layout.focus(input_field)
             event.app.invalidate()
 
@@ -949,6 +1562,18 @@ class TerminalApp:
                 self._print_message(
                     "[bright_black]已取消输入 · /exit 退出[/]"
                 )
+            event.app.invalidate()
+
+        @bindings.add("escape", filter=Condition(
+            lambda: not self._overlay_visible() and not self._has_completions(input_field)
+            and self._active_cancellation is not None
+            and (
+                self._selection_control is None
+                or self._selection_control.snapshot is None
+            )
+        ))
+        def cancel_running_task(event) -> None:
+            self._cancel_current_task()
             event.app.invalidate()
 
         @bindings.add("escape", filter=Condition(
@@ -1096,6 +1721,10 @@ class TerminalApp:
             self._mode_selection = (
                 self._mode_selection + offset
             ) % len(PermissionMode)
+        elif self._resume_selector_open and self._resume_candidates:
+            self._resume_selection = (
+                self._resume_selection + offset
+            ) % len(self._resume_candidates)
 
     def _confirm_mode(self) -> None:
         mode = list(PermissionMode)[self._mode_selection]
@@ -1137,8 +1766,8 @@ class TerminalApp:
             if self._handle_command(task):
                 application.exit()
             return
-        self.history.append(task)
-        self._enqueue_task(task)
+        turn_index = self._record_task_submission(task)
+        self._enqueue_task(task, turn_index=turn_index, recorded=True)
 
     def _request_exit(self, application: Application[Any]) -> None:
         with self._state_lock:
@@ -1155,6 +1784,7 @@ class TerminalApp:
         return (
             self._active_permission is not None
             or self._mode_selector_open
+            or self._resume_selector_open
         )
 
     def _permission_fragments(self) -> FormattedText:
@@ -1214,6 +1844,33 @@ class TerminalApp:
         )
         return FormattedText(fragments)
 
+    def _resume_fragments(self) -> FormattedText:
+        fragments: list[tuple[str, str]] = [
+            ("class:overlay.title", "  恢复会话\n\n")
+        ]
+        current_id = self.session.id if self.session is not None else None
+        for index, session in enumerate(self._resume_candidates[:10]):
+            active = index == self._resume_selection
+            marker = " *" if session.id == current_id else ""
+            title = session.title or "New session"
+            if len(title) > 40:
+                title = title[:37] + "..."
+            fragments.extend(
+                [
+                    ("class:overlay.cursor", "  ❯ " if active else "    "),
+                    (
+                        "class:overlay.selected" if active else "class:overlay.option",
+                        f"{session.id}{marker}  ",
+                    ),
+                    ("class:overlay.meta", f"{len(session.tasks)} tasks  "),
+                    ("class:overlay.option", f"{title}\n"),
+                ]
+            )
+        fragments.append(
+            ("class:overlay.help", "\n  ↑↓ 选择 · Enter 恢复 · Esc 取消")
+        )
+        return FormattedText(fragments)
+
     def _transcript_fragments(self) -> FormattedText:
         with self._state_lock:
             width = get_app().output.get_size().columns
@@ -1231,6 +1888,29 @@ class TerminalApp:
             self._transcript.append(text)
             self._transcript_styled.extend(styled)
             self._transcript_lines += max(0, self._fragment_line_count(styled) - 1)
+        self._invalidate()
+
+    def _update_streaming_renderables(
+        self,
+        objects,
+        options=None,
+        final: bool = False,
+    ) -> None:
+        """Replace the current assistant preview without appending old frames."""
+
+        block = TranscriptBlock(tuple(objects), options or {})
+        with self._state_lock:
+            index = self._streaming_block_index
+            if index is None or index >= len(self._transcript_blocks):
+                index = len(self._transcript_blocks)
+                self._streaming_block_index = index
+                self._transcript_blocks.append(block)
+                self._transcript.append("")
+            else:
+                self._transcript_blocks[index] = block
+            self._reflow_transcript(self._transcript_width)
+            if final:
+                self._streaming_block_index = None
         self._invalidate()
 
     def _reflow_transcript(self, width: int) -> None:
@@ -1472,6 +2152,7 @@ class TerminalApp:
 
     def _status_fragments(self) -> FormattedText:
         path = self._display_path(self.workspace)
+        session = self._session_status_label()
         permission_mode = self._current_permission_mode()
         if self.plan_mode:
             modes = [("plan mode on", "class:session-status.mode.plan")]
@@ -1493,6 +2174,13 @@ class TerminalApp:
             ("class:session-status.separator", "  ·  "),
             ("class:session-status.path", path),
         ]
+        if session:
+            fragments.extend(
+                [
+                    ("class:session-status.separator", "  ·  "),
+                    ("class:session-status.session", session),
+                ]
+            )
         # Reserve the right-hand mode before fitting the model/path; never
         # let a long workspace push the permission indicator off screen.
         suffix = modes[0] if modes else None
@@ -1509,6 +2197,14 @@ class TerminalApp:
             fitted.append(("", " " * padding))
             fitted.append((style, self._truncate_cells(label, width)))
         return FormattedText(fitted)
+
+    def _session_status_label(self) -> str | None:
+        if self.session is None:
+            return None
+        title = self.session.title.strip()
+        if title and title != "New session":
+            return title
+        return None
 
     def _cycle_mode(self) -> None:
         """Cycle Ask → Accept edits → Full Access → Plan → Ask."""

@@ -229,10 +229,15 @@ class TerminalRenderer:
         self._activity_handler: Callable[[str | None, float | None], None] | None = None
         self._output_handler: Callable[[str], None] | None = None
         self._render_handler = None
+        self._stream_render_handler = None
 
     def set_render_handler(self, handler) -> None:
         """Preserve source renderables for width-dependent transcript layout."""
         self._render_handler = handler
+
+    def set_stream_render_handler(self, handler) -> None:
+        """Replace one cumulative Markdown preview instead of appending snapshots."""
+        self._stream_render_handler = handler
 
     def set_activity_handler(
         self,
@@ -323,16 +328,21 @@ class TerminalRenderer:
             self._visible_answer_text = ""
             return
         if event.type is EventType.RUN_FAILED:
+            self._finish_streaming_preview()
             self.close()
             error = str(event.data.get("error", "运行失败"))
             self._print(Text.assemble(("✕ ", "bold red"), (error, "red")))
         if event.type is EventType.RUN_CANCELLED:
             self.close()
-            remaining = self._answer_text[len(self._visible_answer_text):]
-            if remaining.strip():
-                if not self._streamed_answer:
-                    self._print(Text("✦ Mini Agent", style=f"bold {ACCENT}"))
-                self._print(Markdown(remaining))
+            if self._stream_render_handler is not None and self._answer_text.strip():
+                self._publish_streaming_preview(self._answer_text, final=True)
+            elif self._answer_text.strip():
+                self._print(
+                    *self.answer_renderables(
+                        self._answer_text,
+                        leading_blank=False,
+                    )
+                )
             self._print(Text("  ■ 当前任务已取消", style="yellow"))
             self._answer_text = ""
             self._visible_answer_text = ""
@@ -340,6 +350,25 @@ class TerminalRenderer:
     def toggle_verbose(self) -> bool:
         self.verbose = not self.verbose
         return self.verbose
+
+    def answer_renderables(
+        self,
+        answer: str,
+        *,
+        leading_blank: bool = True,
+    ) -> tuple[Any, ...]:
+        """Build the shared Markdown view used by live and resumed answers."""
+
+        renderables: list[Any] = []
+        if leading_blank:
+            renderables.append(Text(""))
+        renderables.extend(
+            [
+                Text("✦ Mini Agent", style=f"bold {ACCENT}"),
+                Markdown(answer),
+            ]
+        )
+        return tuple(renderables)
 
     def close(self) -> None:
         self._stop_status()
@@ -362,7 +391,9 @@ class TerminalRenderer:
         self._stop_status()
         answer = str(data.get("answer", ""))
         renderables: list[Any] = []
-        if self._streamed_answer:
+        if self._stream_render_handler is not None and self._has_answer_stream:
+            self._publish_streaming_preview(answer, final=True)
+        elif self._streamed_answer:
             committed = len(self._visible_answer_text)
             # Runtime trims the final answer. Streaming offsets refer to the
             # untrimmed JSON string, so leading whitespace must be accounted for.
@@ -376,13 +407,7 @@ class TerminalRenderer:
                 renderables.append(Markdown(remaining))
                 self._answer_blocks_written += 1
         else:
-            renderables.extend(
-                [
-                    Text(""),
-                    Text("✦ Mini Agent", style=f"bold {ACCENT}"),
-                    Markdown(answer),
-                ]
-            )
+            renderables.extend(self.answer_renderables(answer))
 
         elapsed = self._elapsed(self._run_started_at)
         steps = data.get("steps", 0)
@@ -420,23 +445,26 @@ class TerminalRenderer:
         self._visible_answer_text = visible_text
         if not new_text:
             return
-        renderables: list[Any] = []
-        if not self._streamed_answer:
-            renderables.extend(
-                [
-                    Text(""),
-                    Text("✦ Mini Agent", style=f"bold {ACCENT}"),
-                ]
-            )
-            self._streamed_answer = True
-        elif self._answer_blocks_written:
-            renderables.append(Text(""))
-        # Commit each complete line exactly once. Re-rendering the accumulated
-        # answer in a Live region leaks old frames into scrollback when a long
-        # response exceeds the terminal height.
-        renderables.append(Markdown(new_text))
-        self._print(Group(*renderables))
-        self._answer_blocks_written += 1
+        if self._stream_render_handler is not None:
+            self._publish_streaming_preview(visible_text, final=False)
+            return
+        # A permanent terminal transcript cannot safely append independently
+        # parsed Markdown suffixes: lists, quotes, tables, and indented code
+        # may continue across a blank line. Non-interactive output therefore
+        # waits for RUN_COMPLETED and renders the complete document once.
+        return
+
+    def _publish_streaming_preview(self, text: str, *, final: bool) -> None:
+        if self._stream_render_handler is None:
+            return
+        renderables = list(self.answer_renderables(text))
+        self._stream_render_handler(tuple(renderables), {}, final)
+        self._streamed_answer = True
+        self._answer_blocks_written = 1
+
+    def _finish_streaming_preview(self) -> None:
+        if self._stream_render_handler is not None and self._answer_text.strip():
+            self._publish_streaming_preview(self._answer_text, final=True)
 
     @staticmethod
     def _stable_streaming_text(text: str) -> str:
