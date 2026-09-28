@@ -4,7 +4,7 @@ import unittest
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
-from model.llm import ChatCompletionsLLM, ModelError, parse_json_object
+from model.llm import ChatCompletionsLLM, ModelError, TokenUsage, parse_json_object
 
 
 class ParseModelResponseTests(unittest.TestCase):
@@ -32,7 +32,12 @@ class ChatCompletionsLLMTests(unittest.TestCase):
             {
                 "choices": [
                     {"message": {"content": '{"final_answer":"finished"}'}}
-                ]
+                ],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 2,
+                    "total_tokens": 9,
+                },
             }
         ).encode()
         model = ChatCompletionsLLM(
@@ -40,9 +45,13 @@ class ChatCompletionsLLMTests(unittest.TestCase):
             base_url="https://example.test/v1/",
             api_key="secret",
         )
+        usages: list[TokenUsage] = []
 
         with patch("model.llm.urllib.request.urlopen", return_value=response) as call:
-            result = model.chat([{"role": "user", "content": "hello"}])
+            result = model.chat(
+                [{"role": "user", "content": "hello"}],
+                on_usage=usages.append,
+            )
 
         request = call.call_args.args[0]
         payload = json.loads(request.data)
@@ -51,6 +60,10 @@ class ChatCompletionsLLMTests(unittest.TestCase):
         self.assertEqual(payload["model"], "test-model")
         self.assertNotIn("temperature", payload)
         self.assertEqual(result, {"final_answer": "finished"})
+        self.assertEqual(
+            usages,
+            [TokenUsage(prompt_tokens=7, completion_tokens=2, total_tokens=9)],
+        )
 
     def test_streams_content_deltas_and_parses_complete_message(self) -> None:
         response = MagicMock()
@@ -59,6 +72,8 @@ class ChatCompletionsLLMTests(unittest.TestCase):
             [
                 b'data: {"choices":[{"delta":{"content":"{\\"final_"}}]}\n',
                 b'data: {"choices":[{"delta":{"content":"answer\\":\\"ok\\"}"}}]}\n',
+                b'data: {"choices":[],"usage":{"prompt_tokens":5,'
+                b'"completion_tokens":4,"total_tokens":9}}\n',
                 b"data: [DONE]\n",
             ]
         )
@@ -66,16 +81,24 @@ class ChatCompletionsLLMTests(unittest.TestCase):
             model="test-model", base_url="https://example.test/v1"
         )
         deltas: list[str] = []
+        usages: list[TokenUsage] = []
 
         with patch("model.llm.urllib.request.urlopen", return_value=response) as call:
             result = model.stream_chat(
-                [{"role": "user", "content": "hello"}], deltas.append
+                [{"role": "user", "content": "hello"}],
+                deltas.append,
+                on_usage=usages.append,
             )
 
         payload = json.loads(call.call_args.args[0].data)
         self.assertTrue(payload["stream"])
+        self.assertEqual(payload["stream_options"], {"include_usage": True})
         self.assertEqual(deltas, ['{"final_', 'answer":"ok"}'])
         self.assertEqual(result, {"final_answer": "ok"})
+        self.assertEqual(
+            usages,
+            [TokenUsage(prompt_tokens=5, completion_tokens=4, total_tokens=9)],
+        )
 
     def test_retries_rate_limit_using_server_delay(self) -> None:
         rate_limit = urllib.error.HTTPError(

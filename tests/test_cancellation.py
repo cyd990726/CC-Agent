@@ -61,7 +61,7 @@ class CancellationTests(unittest.TestCase):
         ready = threading.Event()
 
         class Model(QueueLLM):
-            def stream_chat(self, messages, on_delta=None):
+            def stream_chat(self, messages, on_delta=None, on_usage=None):
                 if messages[-1]["content"] == "first":
                     ready.set()
                     current_token.get().wait(10)

@@ -52,7 +52,7 @@ from model.llm import ModelError
 from ui.permissions import (
     PERMISSION_LABELS, PERMISSION_OPTIONS, SessionPermissionHandler, permission_choices,
 )
-from ui.logo import render_logo
+from ui.logo import LOGO_ANIMATION_FRAMES, render_logo
 from ui.renderer import TerminalRenderer
 from ui.transcript import TranscriptBlock
 from ui.selection import TranscriptSelectionControl, copy_to_clipboard
@@ -232,6 +232,7 @@ INPUT_STYLE = Style.from_dict(
         "session-status.separator": "#3f3f46",
         "session-status.path": "#a78bfa",
         "session-status.session": "#facc15",
+        "session-status.tokens": "#34d399",
         "session-status.activity": "#22d3ee",
         "session-status.mode.accept": "#4ade80 bold",
         "session-status.mode.danger": "#ef4444 bold",
@@ -305,6 +306,9 @@ class TerminalApp:
         self._transcript_blocks: list[TranscriptBlock] = []
         self._transcript_width = console.width
         self._transcript_styled: list[tuple[str, str]] = []
+        self._transcript_line_fragments: tuple[tuple[tuple[str, str], ...], ...] = (
+            ((),)
+        )
         self._transcript_lines = 1
         self._transcript_cursor_line: int | None = None
         self._streaming_block_index: int | None = None
@@ -317,6 +321,8 @@ class TerminalApp:
         self._resume_candidates: list[SessionRecord] = []
         self._activity_message: str | None = None
         self._activity_started_at: float | None = None
+        self._header_frame = 0
+        self._last_header_frame_at = 0.0
         self._application: Application[Any] | None = None
         self._input_field: TextArea | None = None
         self._transcript_window: _TranscriptWindow | None = None
@@ -360,15 +366,7 @@ class TerminalApp:
         return 0
 
     def _run_interactive(self) -> int:
-        self._refresh_header_frame()
-        self._transcript = [self._header_markup]
-        self._transcript_styled = list(
-            to_formatted_text(ANSI(self._header_markup))
-        )
-        self._transcript_lines = self._fragment_line_count(
-            self._transcript_styled
-        )
-        self._transcript_blocks = [TranscriptBlock((self._header_content(),))]
+        self._reset_transcript_to_header()
         self.renderer.set_activity_handler(self._update_activity)
         self.renderer.set_output_handler(self._write_transcript)
         self.renderer.set_render_handler(self._append_renderables)
@@ -456,7 +454,7 @@ class TerminalApp:
                 f"[bright_black]  ↳ 已排队 · 第 {position} 个任务[/]"
             )
 
-    def _record_task_submission(self, task: str) -> int | None:
+    def _record_task_submission(self, task: str, *, persist: bool = True) -> int | None:
         self.history.append(task)
         if self.session is None or self.session_store is None:
             return None
@@ -475,10 +473,11 @@ class TerminalApp:
         if self.session.title == "New session" and self.history:
             self.session.title = self.history[0][:80]
         turn_index = len(self.session.turns) - 1
-        try:
-            self.session_store.save(self.session)
-        except OSError as exc:
-            self._print_message(f"[yellow]会话保存失败：{exc}[/]")
+        if persist:
+            try:
+                self.session_store.save(self.session)
+            except OSError as exc:
+                self._print_message(f"[yellow]会话保存失败：{exc}[/]")
         return turn_index
 
     def _task_worker(self) -> None:
@@ -670,6 +669,10 @@ class TerminalApp:
         if event.type is EventType.TOOL_STARTED:
             turn["status"] = "running"
             turn["current_tool"] = str(event.data.get("tool", "unknown"))
+        elif event.type is EventType.MODEL_USAGE:
+            usage = event.data.get("usage")
+            if isinstance(usage, Mapping):
+                self._add_turn_usage(turn, usage)
         elif event.type is EventType.MODEL_COMPLETED:
             response = event.data.get("response")
             if isinstance(response, Mapping) and (
@@ -701,6 +704,9 @@ class TerminalApp:
             turn["status"] = "completed"
             turn["answer"] = str(event.data.get("answer", "")).strip()
             turn["steps"] = event.data.get("steps")
+            usage = event.data.get("usage")
+            if isinstance(usage, Mapping):
+                turn["usage"] = self._normalize_usage(usage)
             turn.pop("current_tool", None)
         elif event.type is EventType.RUN_FAILED:
             turn["status"] = "failed"
@@ -839,6 +845,7 @@ class TerminalApp:
             turn["status"] = "completed"
         elif turn.get("status") not in {"failed", "cancelled"}:
             turn["status"] = "running"
+        turn["usage"] = self._normalize_usage(state.token_usage)
         turn.pop("current_tool", None)
         self._save_current_session()
 
@@ -1013,6 +1020,7 @@ class TerminalApp:
         table.add_row("Tasks", str(len(self.history)))
         if self.session is not None:
             table.add_row("Session", self.session.id)
+            table.add_row("Tokens", self._format_usage_detail(self._session_usage()))
         if self.memory is not None:
             table.add_row("Memory", self._display_path(self.memory.entrypoint))
         self._print_message(
@@ -1112,7 +1120,7 @@ class TerminalApp:
             self._transcript = [header_text]
             self._transcript_blocks = [header_block]
             self._transcript_styled = header_styled
-            self._transcript_lines = self._fragment_line_count(header_styled)
+            self._rebuild_transcript_line_cache()
             self._transcript_cursor_line = None
             self._streaming_block_index = None
         if self._transcript_window is not None:
@@ -1315,6 +1323,7 @@ class TerminalApp:
 
         transcript_control = TranscriptSelectionControl(
             self._transcript_fragments,
+            source_lines=self._transcript_fragment_lines,
             on_start=self._start_selection,
             on_copy=self._copy_selection,
         )
@@ -1674,6 +1683,7 @@ class TerminalApp:
         while True:
             await asyncio.sleep(0.1)
             changed = self._activate_permission_request()
+            changed = self._advance_header_animation() or changed
             with self._state_lock:
                 active = self._activity_message is not None
             if changed or active:
@@ -1766,7 +1776,7 @@ class TerminalApp:
             if self._handle_command(task):
                 application.exit()
             return
-        turn_index = self._record_task_submission(task)
+        turn_index = self._record_task_submission(task, persist=False)
         self._enqueue_task(task, turn_index=turn_index, recorded=True)
 
     def _request_exit(self, application: Application[Any]) -> None:
@@ -1879,6 +1889,13 @@ class TerminalApp:
             fragments = tuple(self._transcript_styled)
         return FormattedText(fragments)
 
+    def _transcript_fragment_lines(self):
+        with self._state_lock:
+            width = get_app().output.get_size().columns
+            if self._transcript_blocks and width != self._transcript_width:
+                self._reflow_transcript(width)
+            return self._transcript_line_fragments
+
     def _append_renderables(self, objects, options=None) -> None:
         block = TranscriptBlock(tuple(objects), options or {})
         with self._state_lock:
@@ -1887,7 +1904,7 @@ class TerminalApp:
             styled = list(to_formatted_text(ANSI(text)))
             self._transcript.append(text)
             self._transcript_styled.extend(styled)
-            self._transcript_lines += max(0, self._fragment_line_count(styled) - 1)
+            self._rebuild_transcript_line_cache()
         self._invalidate()
 
     def _update_streaming_renderables(
@@ -1933,8 +1950,42 @@ class TerminalApp:
                 new_top += new_count
         self._transcript = chunks
         self._transcript_styled = list(to_formatted_text(ANSI("".join(chunks))))
-        self._transcript_lines = self._fragment_line_count(self._transcript_styled)
+        self._rebuild_transcript_line_cache()
         self._transcript_width = width
+
+    def _reset_transcript_to_header(self) -> None:
+        self._header_frame = 0
+        self._last_header_frame_at = time.monotonic()
+        self._refresh_header_frame(frame=self._header_frame)
+        self._transcript = [self._header_markup]
+        self._transcript_styled = list(
+            to_formatted_text(ANSI(self._header_markup))
+        )
+        self._rebuild_transcript_line_cache()
+        self._transcript_blocks = [TranscriptBlock((self._header_content(),))]
+
+    def _advance_header_animation(self) -> bool:
+        if not self._ui_active or len(self._transcript_blocks) != 1:
+            return False
+        now = time.monotonic()
+        if now - self._last_header_frame_at < 0.28:
+            return False
+        self._header_frame = (self._header_frame + 1) % len(LOGO_ANIMATION_FRAMES)
+        self._last_header_frame_at = now
+        header_block = TranscriptBlock((self._header_content(self._header_frame),))
+        header_text = header_block.render(
+            self._transcript_width,
+            self.console.color_system,
+        )
+        header_styled = list(to_formatted_text(ANSI(header_text)))
+        with self._state_lock:
+            if len(self._transcript_blocks) != 1:
+                return False
+            self._transcript_blocks[0] = header_block
+            self._transcript = [header_text]
+            self._transcript_styled = header_styled
+            self._rebuild_transcript_line_cache()
+        return True
 
     def _transcript_target_line(self) -> int:
         with self._state_lock:
@@ -1959,7 +2010,7 @@ class TerminalApp:
             if active:
                 self._transcript.append(text)
                 self._transcript_styled.extend(styled)
-                self._transcript_lines += max(0, added_lines - 1)
+                self._rebuild_transcript_line_cache()
                 invalidate = self._invalidate_input
             else:
                 invalidate = None
@@ -1976,6 +2027,14 @@ class TerminalApp:
         fragments: list[tuple[str, str]],
     ) -> int:
         return max(1, sum(1 for _line in split_lines(fragments)))
+
+    def _rebuild_transcript_line_cache(self) -> None:
+        lines = tuple(
+            tuple(line)
+            for line in split_lines(self._transcript_styled)
+        )
+        self._transcript_line_fragments = lines or (((),),)
+        self._transcript_lines = max(1, len(self._transcript_line_fragments))
 
     def _print_message(self, *objects: Any) -> None:
         if not self._ui_active:
@@ -2105,9 +2164,11 @@ class TerminalApp:
         width = get_app().output.get_size().columns
         if self._selection_control is not None and self._selection_control.snapshot is not None:
             message = self._copy_notice or "拖动选择文本"
-            return FormattedText([("class:session-status", self._truncate_cells(
-                f"  {message} · Ctrl+C 复制 · Esc 清除选区", width
-            ))])
+            return self._activity_line_fragments(
+                f"  {message} · Ctrl+C 复制 · Esc 清除选区",
+                "class:session-status",
+                width,
+            )
         with self._state_lock:
             message = self._activity_message
             started_at = self._activity_started_at
@@ -2116,21 +2177,48 @@ class TerminalApp:
                 and self._transcript_window._view_anchor is not None
             )
         if browsing:
-            return FormattedText([("class:session-status", self._truncate_cells(
-                "  正在查看历史 · Ctrl+End 返回最新内容", width
-            ))])
+            return self._activity_line_fragments(
+                "  正在查看历史 · Ctrl+End 返回最新内容",
+                "class:session-status",
+                width,
+            )
         if message is None or started_at is None:
-            return FormattedText([])
+            return self._activity_line_fragments("", "class:session-status", width)
 
         frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         frame = frames[int(time.monotonic() * 10) % len(frames)]
         elapsed = TerminalRenderer._elapsed(started_at)
-        label = self._truncate_cells(
-            f"{frame} {message} · {elapsed}", max(1, width - 2)
+        return self._activity_line_fragments(
+            f"  {frame} {message} · {elapsed}",
+            "class:session-status.activity",
+            width,
         )
+
+    def _activity_line_fragments(
+        self,
+        left: str,
+        left_style: str,
+        width: int,
+    ) -> FormattedText:
+        usage_label = self._format_usage_total(self._session_usage())
+        if not usage_label:
+            return FormattedText(
+                [(left_style, self._truncate_cells(left, width))] if left else []
+            )
+        right = f" {usage_label} "
+        right_width = get_cwidth(right)
+        if right_width >= width:
+            return FormattedText(
+                [("class:session-status.tokens", self._truncate_cells(right, width))]
+            )
+        left_width = max(0, width - right_width)
+        clipped_left = self._truncate_cells(left, left_width)
+        padding = " " * max(0, width - get_cwidth(clipped_left) - right_width)
         return FormattedText(
             [
-                ("class:session-status.activity", f"  {label}"),
+                (left_style, clipped_left),
+                ("", padding),
+                ("class:session-status.tokens", right),
             ]
         )
 
@@ -2198,6 +2286,72 @@ class TerminalApp:
             fitted.append((style, self._truncate_cells(label, width)))
         return FormattedText(fitted)
 
+    @staticmethod
+    def _normalize_usage(usage: Mapping[str, Any]) -> dict[str, int]:
+        normalized: dict[str, int] = {}
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            try:
+                value = int(usage.get(key, 0))
+            except (TypeError, ValueError):
+                value = 0
+            normalized[key] = max(0, value)
+        if normalized["total_tokens"] == 0:
+            normalized["total_tokens"] = (
+                normalized["prompt_tokens"] + normalized["completion_tokens"]
+            )
+        return normalized
+
+    def _add_turn_usage(self, turn: dict[str, Any], usage: Mapping[str, Any]) -> None:
+        current = self._normalize_usage(
+            turn.get("usage") if isinstance(turn.get("usage"), Mapping) else {}
+        )
+        incoming = self._normalize_usage(usage)
+        turn["usage"] = {
+            key: current[key] + incoming[key]
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+        }
+
+    def _session_usage(self) -> dict[str, int]:
+        total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        if self.session is None:
+            return total
+        for turn in self.session.turns:
+            if not isinstance(turn, Mapping):
+                continue
+            usage = turn.get("usage")
+            if not isinstance(usage, Mapping):
+                continue
+            normalized = self._normalize_usage(usage)
+            for key, value in normalized.items():
+                total[key] += value
+        return total
+
+    @staticmethod
+    def _format_usage_total(usage: Mapping[str, int]) -> str:
+        total = int(usage.get("total_tokens", 0))
+        return f"{TerminalApp._format_token_count(total)} tokens" if total else ""
+
+    @staticmethod
+    def _format_usage_detail(usage: Mapping[str, int]) -> str:
+        prompt = int(usage.get("prompt_tokens", 0))
+        completion = int(usage.get("completion_tokens", 0))
+        total = int(usage.get("total_tokens", 0))
+        if total == 0:
+            return "not reported"
+        return (
+            f"{TerminalApp._format_token_count(total)} total "
+            f"({TerminalApp._format_token_count(prompt)} prompt, "
+            f"{TerminalApp._format_token_count(completion)} completion)"
+        )
+
+    @staticmethod
+    def _format_token_count(value: int) -> str:
+        if value >= 1_000_000:
+            return f"{value / 1_000_000:.1f}M"
+        if value >= 1_000:
+            return f"{value / 1_000:.1f}k"
+        return str(value)
+
     def _session_status_label(self) -> str | None:
         if self.session is None:
             return None
@@ -2233,7 +2387,7 @@ class TerminalApp:
             return self.permission_handler.mode
         return PermissionMode.ASK
 
-    def _refresh_header_frame(self) -> None:
+    def _refresh_header_frame(self, *, frame: int = 0) -> None:
         output = StringIO()
         header_console = Console(
             file=output,
@@ -2241,5 +2395,5 @@ class TerminalApp:
             force_terminal=self.console.color_system is not None,
             color_system=self.console.color_system,
         )
-        header_console.print(self._header_content())
+        header_console.print(self._header_content(frame))
         self._header_markup = output.getvalue()
