@@ -3,6 +3,7 @@
 from .base import Tool, ToolExecutor, ToolResult
 from .discovery import FindFilesTool, ListFilesTool
 from .file import EditFileTool, ReadFileTool, WriteFileTool
+from .memory import ReadMemoryTool, RememberTool
 from .search import SearchTool
 from .shell import ShellTool
 from .web import FetchUrlTool, WebSearchTool, create_search_provider
@@ -13,6 +14,8 @@ __all__ = [
     "FetchUrlTool",
     "ListFilesTool",
     "ReadFileTool",
+    "ReadMemoryTool",
+    "RememberTool",
     "SearchTool",
     "ShellTool",
     "Tool",
