@@ -12,6 +12,13 @@ from agent.diagnostics import run_doctor
 from agent.permissions import PermissionMode
 from agent.runtime import AgentRuntime
 from agent.sandbox import SandboxManager
+from agent.settings import (
+    SettingsError,
+    discover_project_settings,
+    load_toml_settings,
+    set_environment_defaults,
+    user_settings_path,
+)
 from model.llm import ChatCompletionsLLM
 from tools import (
     EditFileTool,
@@ -117,7 +124,11 @@ def main(argv: list[str] | None = None) -> int:
     if arguments and arguments[0] == "init":
         return _run_init_command(arguments[1:])
 
-    loaded_configs = load_configuration(cwd=safe_cwd)
+    try:
+        loaded_configs = load_configuration(cwd=safe_cwd)
+    except (SettingsError, ValueError) as exc:
+        Console().print(f"[red]配置错误：{exc}[/]")
+        return 2
     if arguments and arguments[0] == "doctor":
         return _run_doctor_command(arguments[1:], loaded_configs)
 
@@ -195,16 +206,34 @@ def main(argv: list[str] | None = None) -> int:
     return app.run()
 
 
+def configuration_sources(cwd: Path) -> list[Path]:
+    """Return configuration files ordered from highest to lowest precedence."""
+
+    sources: list[Path] = [cwd / ".env"]
+    project_settings = discover_project_settings(cwd)
+    if project_settings is not None:
+        sources.append(project_settings)
+    sources.append(user_config_path())
+    sources.append(user_settings_path())
+    return sources
+
+
 def load_configuration(*, cwd: Path | None = None) -> list[Path]:
-    """Load project then user configuration, preserving shell precedence."""
+    """Load configuration files; the first file defining a key wins.
+
+    Precedence is project ``.env``, project ``mini-agent.toml``, user ``.env``
+    and finally user ``config.toml``. Files are applied with ``setdefault``
+    semantics, so values already present in the shell environment always win.
+    """
 
     loaded: list[Path] = []
-    local_path = (cwd or recover_cwd()) / ".env"
-    user_path = user_config_path()
-    for path in (local_path, user_path):
+    for path in configuration_sources(cwd or recover_cwd()):
         if path in loaded or not path.is_file():
             continue
-        load_env_file(path)
+        if path.suffix.lower() == ".toml":
+            set_environment_defaults(load_toml_settings(path))
+        else:
+            load_env_file(path)
         loaded.append(path)
     return loaded
 
@@ -263,8 +292,8 @@ def _run_doctor_command(argv: list[str], loaded_configs: list[Path]) -> int:
     console = Console()
     if loaded_configs:
         console.print(
-            "[bright_black]Loaded config: "
-            + ", ".join(str(path) for path in loaded_configs)
+            "[bright_black]配置来源（优先级从高到低）："
+            + " → ".join(str(path) for path in loaded_configs)
             + "[/]"
         )
     return run_doctor(

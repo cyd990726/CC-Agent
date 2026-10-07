@@ -61,8 +61,35 @@ Mini Agent 初始化
 - Windows：`%APPDATA%\mini-agent\.env`
 - 设置 `MINI_AGENT_CONFIG` 可以指定其他位置
 
-配置优先级为：Shell 环境变量 → 当前目录 `.env` → 用户配置。API Key 不会显示在
+配置优先级从高到低为：命令行参数 → Shell 环境变量 → 项目 `.env` →
+项目 `mini-agent.toml` → 用户 `.env` → 用户 `config.toml`。API Key 不会显示在
 `doctor` 输出中，用户配置在支持权限位的系统上会设为 `0600`。
+
+### TOML 配置文件
+
+除 `.env` 外，也可以用 TOML 配置文件（参考
+[mini-agent.example.toml](mini-agent.example.toml)）：
+
+- 项目配置：从当前目录向上查找最近的 `mini-agent.toml` 或
+  `.mini-agent.toml`，因此在子目录中运行也会命中项目配置
+- 用户配置：`~/.config/mini-agent/config.toml`
+  （Windows 为 `%APPDATA%\mini-agent\config.toml`），可用 `MINI_AGENT_SETTINGS`
+  指定其他位置
+
+```toml
+model = "bonsai2-27b"
+base_url = "http://127.0.0.1:8080/v1"
+api_key = "your-api-key"
+max_steps = 20
+sandbox = false
+
+[search]
+provider = "tavily"
+tavily_api_key = "your-tavily-key"
+```
+
+键名写错、类型不对或值为空时会直接报错，并指出文件和键名。
+`mini-agent doctor` 会按优先级列出实际加载的配置文件。
 
 也可以复制 [.env.example](.env.example) 手动配置：
 
