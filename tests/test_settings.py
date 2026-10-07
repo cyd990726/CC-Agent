@@ -152,7 +152,10 @@ class SettingsPathTests(unittest.TestCase):
 class SettingsPrecedenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self._temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self._temporary.name)
+        # ``discover_project_settings`` resolves symlinks, and on macOS/Windows
+        # the temporary directory path differ from its resolved form
+        # (/var -> /private/var, 8.3 short names), so compare resolved paths.
+        self.root = Path(self._temporary.name).resolve()
         self.project = self.root / "project"
         self.project.mkdir()
         self.user_env = self.root / "user.env"
