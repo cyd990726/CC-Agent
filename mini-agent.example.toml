@@ -1,0 +1,27 @@
+# Example Mini Agent configuration.
+#
+# Copy to one of these locations:
+#   - project:  ./mini-agent.toml   (nearest one wins, searched upward)
+#   - user:     ~/.config/mini-agent/config.toml
+#               %APPDATA%\mini-agent\config.toml (Windows)
+#
+# Precedence, highest first:
+#   CLI flags > shell environment > project .env > project mini-agent.toml
+#   > user .env > user config.toml > built-in defaults
+
+model = "bonsai2-27b"
+base_url = "http://127.0.0.1:8080/v1"
+api_key = "your-api-key"
+
+# Optional runtime limits.
+max_steps = 20
+# max_rpm = 3
+
+# Optional shell sandbox (requires bubblewrap on Linux).
+sandbox = false
+
+[search]
+# provider = "tavily"  # tavily | brave | serper
+# tavily_api_key = ""
+# brave_api_key = ""
+# serper_api_key = ""
