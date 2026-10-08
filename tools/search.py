@@ -13,13 +13,41 @@ from tools.file import WorkspaceTool
 class SearchTool(WorkspaceTool):
     name = "search"
     description = "Search text files in the workspace and return matching lines."
-    args_schema = {
-        "query": "string; literal text or regular expression",
-        "path": "optional string; file or directory, defaults to .",
-        "glob": "optional string; filename glob such as *.py",
-        "regex": "optional boolean; defaults to false",
-        "max_results": "optional positive integer; defaults to 100",
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Literal text or regular expression to search for",
+            },
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "File or directory to search; defaults to .",
+            },
+            "glob": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Optional filename glob such as *.py",
+            },
+            "regex": {
+                "type": "boolean",
+                "description": "Interpret query as a regular expression",
+                "default": False,
+            },
+            "max_results": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum matching lines; defaults to 100",
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": False,
     }
+    read_only = True
+    concurrency_safe = True
+    max_output_chars = 100_000
 
     def run(self, args: Mapping[str, Any]) -> str:
         query = require_string(args, "query")

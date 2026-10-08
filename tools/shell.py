@@ -19,10 +19,27 @@ class ShellTool(Tool):
     description = (
         "Run a shell command in the workspace and capture its exit code and output."
     )
-    args_schema = {
-        "command": "string; shell command to run",
-        "timeout": "optional number of seconds; defaults to 60",
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Shell command to run",
+            },
+            "timeout": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "Timeout in seconds; defaults to 60",
+            },
+        },
+        "required": ["command"],
+        "additionalProperties": False,
     }
+    read_only = False
+    concurrency_safe = False
+    destructive = True
+    max_output_chars = 30_000
 
     def __init__(
         self,

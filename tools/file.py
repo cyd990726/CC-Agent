@@ -62,11 +62,33 @@ class WorkspaceTool(Tool):
 class ReadFileTool(WorkspaceTool):
     name = "read_file"
     description = "Read all or a line range from a UTF-8 workspace file."
-    args_schema = {
-        "path": "string; path relative to the workspace unless Full Access is enabled",
-        "offset": "optional positive integer; first line to read, 1-based",
-        "limit": "optional positive integer; maximum lines to return",
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Path relative to the workspace unless Full Access is enabled"
+                ),
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "First line to read, using 1-based numbering",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum number of lines to return",
+            },
+        },
+        "required": ["path"],
+        "additionalProperties": False,
     }
+    read_only = True
+    concurrency_safe = True
+    max_output_chars = 100_000
 
     def run(self, args: Mapping[str, Any]) -> str:
         path = self.resolve_path(require_string(args, "path"))
@@ -109,10 +131,28 @@ class ReadFileTool(WorkspaceTool):
 class WriteFileTool(WorkspaceTool):
     name = "write_file"
     description = "Create or replace a UTF-8 text file in the workspace."
-    args_schema = {
-        "path": "string; path relative to the workspace unless Full Access is enabled",
-        "content": "string; complete new file content",
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Path relative to the workspace unless Full Access is enabled"
+                ),
+            },
+            "content": {
+                "type": "string",
+                "description": "Complete new file content; may be empty",
+            },
+        },
+        "required": ["path", "content"],
+        "additionalProperties": False,
     }
+    read_only = False
+    concurrency_safe = False
+    destructive = True
+    max_output_chars = 100_000
 
     def run(self, args: Mapping[str, Any]) -> str:
         path = self.resolve_path(require_string(args, "path"))
@@ -130,11 +170,33 @@ class EditFileTool(WorkspaceTool):
     description = (
         "Replace one uniquely matching text block in a UTF-8 workspace file."
     )
-    args_schema = {
-        "path": "string; path relative to the workspace unless Full Access is enabled",
-        "old_text": "string; exact text that must occur exactly once",
-        "new_text": "string; replacement text, which may be empty",
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Path relative to the workspace unless Full Access is enabled"
+                ),
+            },
+            "old_text": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact text that must occur exactly once",
+            },
+            "new_text": {
+                "type": "string",
+                "description": "Replacement text, which may be empty",
+            },
+        },
+        "required": ["path", "old_text", "new_text"],
+        "additionalProperties": False,
     }
+    read_only = False
+    concurrency_safe = False
+    destructive = True
+    max_output_chars = 100_000
 
     def run(self, args: Mapping[str, Any]) -> str:
         path = self.resolve_path(require_string(args, "path"))
