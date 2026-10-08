@@ -268,10 +268,27 @@ class WebSearchTool(Tool):
         "Search the public web for current information and return titles, URLs, "
         "and snippets. Use fetch_url to read a promising result in full."
     )
-    args_schema = {
-        "query": "string; search query",
-        "max_results": "optional positive integer from 1 to 10; defaults to 5",
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Search query",
+            },
+            "max_results": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_SEARCH_RESULTS,
+                "description": "Maximum results to return; defaults to 5",
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": False,
     }
+    read_only = True
+    concurrency_safe = True
+    max_output_chars = 100_000
 
     def __init__(self, provider: SearchProvider) -> None:
         self.provider = provider
@@ -391,12 +408,27 @@ class FetchUrlTool(Tool):
         "Fetch a public HTTP(S) URL and extract readable text. Private network "
         "addresses and oversized responses are blocked."
     )
-    args_schema = {
-        "url": "string; public http or https URL",
-        "max_chars": (
-            "optional positive integer up to 100000; defaults to 20000"
-        ),
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Public HTTP or HTTPS URL",
+            },
+            "max_chars": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_FETCH_CHARS,
+                "description": "Maximum returned characters; defaults to 20000",
+            },
+        },
+        "required": ["url"],
+        "additionalProperties": False,
     }
+    read_only = True
+    concurrency_safe = True
+    max_output_chars = 100_000
 
     def __init__(
         self,

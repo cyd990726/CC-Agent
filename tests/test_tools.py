@@ -216,6 +216,44 @@ class ToolTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("not configured", result.output)
 
+    def test_builtin_tools_publish_structured_schemas_and_metadata(self) -> None:
+        tools = [
+            ReadFileTool(self.workspace),
+            WriteFileTool(self.workspace),
+            EditFileTool(self.workspace),
+            FindFilesTool(self.workspace),
+            ListFilesTool(self.workspace),
+            SearchTool(self.workspace),
+            ShellTool(self.workspace),
+            WebSearchTool(create_search_provider(environ={})),
+            FetchUrlTool(),
+        ]
+        executor = ToolExecutor(tools)
+
+        descriptions = {item["name"]: item for item in executor.describe()}
+        self.assertEqual(set(descriptions), {tool.name for tool in tools})
+        for tool in tools:
+            with self.subTest(tool=tool.name):
+                self.assertEqual(descriptions[tool.name]["args"]["type"], "object")
+                self.assertIsInstance(tool.read_only, bool)
+                self.assertIsInstance(tool.concurrency_safe, bool)
+                self.assertIsInstance(tool.destructive, bool)
+                self.assertGreater(tool.max_output_chars, 0)
+
+        self.assertEqual(
+            executor.read_only_tool_names(),
+            frozenset(
+                {
+                    "read_file",
+                    "find_files",
+                    "list_files",
+                    "search",
+                    "web_search",
+                    "fetch_url",
+                }
+            ),
+        )
+
     def test_fetch_url_extracts_html_and_ignores_scripts(self) -> None:
         class FakeResponse:
             def __init__(self) -> None:

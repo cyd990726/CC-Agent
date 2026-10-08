@@ -21,11 +21,31 @@ def _positive_integer(value: Any, name: str) -> int:
 class FindFilesTool(WorkspaceTool):
     name = "find_files"
     description = "Find workspace files whose relative paths match a glob pattern."
-    args_schema = {
-        "pattern": "string; glob such as **/*.py or test_*.py",
-        "path": "optional string; search directory, defaults to .",
-        "max_results": "optional positive integer; defaults to 100",
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Glob such as **/*.py or test_*.py",
+            },
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Search directory; defaults to .",
+            },
+            "max_results": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum matches to return; defaults to 100",
+            },
+        },
+        "required": ["pattern"],
+        "additionalProperties": False,
     }
+    read_only = True
+    concurrency_safe = True
+    max_output_chars = 100_000
 
     def run(self, args: Mapping[str, Any]) -> str:
         pattern = require_string(args, "pattern")
@@ -76,11 +96,30 @@ class FindFilesTool(WorkspaceTool):
 class ListFilesTool(WorkspaceTool):
     name = "list_files"
     description = "List a workspace directory tree with file sizes."
-    args_schema = {
-        "path": "optional string; directory to list, defaults to .",
-        "depth": "optional positive integer; levels to include, defaults to 1",
-        "max_results": "optional positive integer; defaults to 200",
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Directory to list; defaults to .",
+            },
+            "depth": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Directory levels to include; defaults to 1",
+            },
+            "max_results": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum entries to return; defaults to 200",
+            },
+        },
+        "additionalProperties": False,
     }
+    read_only = True
+    concurrency_safe = True
+    max_output_chars = 100_000
 
     def run(self, args: Mapping[str, Any]) -> str:
         root = self.resolve_path(FindFilesTool._path_argument(args))

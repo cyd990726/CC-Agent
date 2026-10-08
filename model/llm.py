@@ -45,6 +45,25 @@ class LLM(ABC):
 
         return self.chat(messages)
 
+    def stream_chat_with_tools(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        tools: Sequence[Mapping[str, Any]],
+        on_delta: Callable[[str], None] | None = None,
+    ) -> Mapping[str, Any]:
+        """Extension point for adapters with native tool calling support.
+
+        The default keeps the current text JSON protocol. Native adapters can
+        override this method and normalize provider tool calls to the same
+        ``action`` / ``final_answer`` response objects consumed by the runtime.
+        """
+
+        del tools
+        return self.stream_chat(
+            messages,
+            on_delta=on_delta,
+        )
+
 
 class ChatCompletionsLLM(LLM):
     """Call any provider exposing an OpenAI-compatible chat completions API."""

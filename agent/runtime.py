@@ -10,7 +10,7 @@ from agent.permissions import PermissionMode
 from agent.prompt import build_system_prompt
 from agent.state import AgentState
 from model.llm import LLM, ModelProtocolError
-from tools.base import READ_ONLY_TOOL_NAMES, ToolExecutor
+from tools.base import ToolExecutor
 
 
 # 智能体运行时错误的基类
@@ -59,7 +59,8 @@ class AgentRuntime:
         """Enable read-only planning or restore the full tool set."""
 
         self.plan_mode = enabled
-        self.tools.set_allowed_tools(READ_ONLY_TOOL_NAMES if enabled else None)
+        allowed_tools = self.tools.read_only_tool_names() if enabled else None
+        self.tools.set_allowed_tools(allowed_tools)
 
     def set_permission_mode(self, mode: PermissionMode) -> None:
         """Change approval behavior and workspace access for future tool calls."""
@@ -114,8 +115,9 @@ class AgentRuntime:
                     step=state.steps + 1,
                 )
                 try:
-                    response = self.model.stream_chat(
+                    response = self.model.stream_chat_with_tools(
                         state.messages,
+                        self.tools.describe(),
                         on_delta=lambda delta: self._emit(
                             on_event,
                             EventType.MODEL_DELTA,

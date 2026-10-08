@@ -41,10 +41,25 @@ class ProtocolErrorThenQueueLLM(QueueLLM):
         return next(self.responses)
 
 
+class ToolAwareQueueLLM(QueueLLM):
+    def __init__(self, responses: list[Mapping[str, Any]]) -> None:
+        super().__init__(responses)
+        self.tools: list[Mapping[str, Any]] = []
+
+    def stream_chat_with_tools(self, messages, tools, on_delta=None):
+        self.tools = list(tools)
+        return self.stream_chat(messages, on_delta=on_delta)
+
+
 class EchoTool(Tool):
     name = "echo"
     description = "Echo text."
-    args_schema = {"text": "string"}
+    input_schema = {
+        "type": "object",
+        "properties": {"text": {"type": "string", "minLength": 1}},
+        "required": ["text"],
+        "additionalProperties": False,
+    }
 
     def run(self, args: Mapping[str, Any]) -> str:
         return str(args["text"])
@@ -82,6 +97,65 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertFalse(state.tool_results[0].success)
         self.assertIn("unknown tool", state.tool_results[0].output)
+
+    def test_invalid_tool_args_are_recoverable_without_protocol_retry(self) -> None:
+        model = QueueLLM(
+            [
+                {"action": {"tool": "echo", "args": {"text": ""}}},
+                {"final_answer": "recovered from invalid arguments"},
+            ]
+        )
+
+        state = AgentRuntime(
+            model,
+            ToolExecutor([EchoTool()]),
+            protocol_retries=0,
+        ).run("test task")
+
+        self.assertTrue(state.finished)
+        self.assertEqual(state.steps, 2)
+        self.assertFalse(state.tool_results[0].success)
+        self.assertIn("args.text", state.tool_results[0].output)
+        payload = json.loads(model.calls[1][-1]["content"].split("\n", 1)[1])
+        self.assertEqual(payload["tool"], "echo")
+        self.assertFalse(payload["success"])
+
+    def test_plan_mode_uses_tool_read_only_metadata(self) -> None:
+        class InspectorTool(EchoTool):
+            name = "inspect_custom"
+            read_only = True
+
+        executor = ToolExecutor([InspectorTool(), EchoTool()])
+        runtime = AgentRuntime(
+            QueueLLM([{"final_answer": "planned"}]),
+            executor,
+            plan_mode=True,
+        )
+
+        self.assertEqual(
+            [description["name"] for description in executor.describe()],
+            ["inspect_custom"],
+        )
+        self.assertTrue(
+            executor.execute("inspect_custom", {"text": "ok"}).success
+        )
+        self.assertFalse(executor.execute("echo", {"text": "no"}).success)
+
+        runtime.set_plan_mode(False)
+
+        self.assertEqual(
+            [description["name"] for description in executor.describe()],
+            ["inspect_custom", "echo"],
+        )
+
+    def test_runtime_passes_structured_tools_to_model_adapter(self) -> None:
+        model = ToolAwareQueueLLM([{"final_answer": "done"}])
+
+        AgentRuntime(model, ToolExecutor([EchoTool()])).run("test task")
+
+        self.assertEqual(len(model.tools), 1)
+        self.assertEqual(model.tools[0]["name"], "echo")
+        self.assertEqual(model.tools[0]["args"], EchoTool.input_schema)
 
     def test_final_answer_tool_shape_is_normalized(self) -> None:
         model = QueueLLM(

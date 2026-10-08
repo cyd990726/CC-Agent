@@ -7,11 +7,7 @@ from typing import Any
 
 from agent.permissions import PermissionMode
 from agent.cancellation import RunCancelled, check_cancelled
-
-
-READ_ONLY_TOOL_NAMES = frozenset(
-    {"read_file", "find_files", "list_files", "search", "web_search", "fetch_url"}
-)
+from tools.schema import SchemaValidationError, validate_schema, validate_value
 
 
 class ToolError(RuntimeError):
@@ -24,6 +20,12 @@ class Tool(ABC):
     name: str
     description: str
     args_schema: Mapping[str, Any]
+    input_schema: Mapping[str, Any]
+    output_schema: Mapping[str, Any] = {"type": "string"}
+    read_only: bool = False
+    concurrency_safe: bool = False
+    destructive: bool = False
+    max_output_chars: int = 100_000
 
     @abstractmethod
     def run(self, args: Mapping[str, Any]) -> str:
@@ -33,8 +35,26 @@ class Tool(ABC):
         return {
             "name": self.name,
             "description": self.description,
-            "args": dict(self.args_schema),
+            "args": dict(self._description_schema()),
         }
+
+    def _description_schema(self) -> Mapping[str, Any]:
+        """Return the public schema, preserving temporary legacy declarations."""
+
+        input_schema = getattr(self, "input_schema", None)
+        if input_schema is not None:
+            return input_schema
+        return getattr(self, "args_schema", {})
+
+    def _validation_schema(self) -> Mapping[str, Any]:
+        """Resolve the input schema used at the executor boundary."""
+
+        input_schema = getattr(self, "input_schema", None)
+        if input_schema is not None:
+            return input_schema
+        # Legacy args_schema values are human-readable strings, not schemas.
+        # Keep legacy custom tools operational until they migrate explicitly.
+        return {"type": "object"}
 
     def set_full_access(self, enabled: bool) -> None:
         """Let tools with workspace boundaries expand them in Full Access mode."""
@@ -83,6 +103,32 @@ class ToolExecutor:
                 raise ValueError("tool name cannot be empty")
             if tool.name in self._tools:
                 raise ValueError(f"duplicate tool name: {tool.name}")
+            for attribute in ("read_only", "concurrency_safe", "destructive"):
+                if not isinstance(getattr(tool, attribute), bool):
+                    raise ValueError(
+                        f"invalid metadata for tool {tool.name!r}: "
+                        f"{attribute} must be a boolean"
+                    )
+            if (
+                not isinstance(tool.max_output_chars, int)
+                or isinstance(tool.max_output_chars, bool)
+                or tool.max_output_chars < 1
+            ):
+                raise ValueError(
+                    f"invalid metadata for tool {tool.name!r}: "
+                    "max_output_chars must be a positive integer"
+                )
+            try:
+                validate_schema(
+                    tool._validation_schema(), path=f"{tool.name}.input_schema"
+                )
+                validate_schema(
+                    tool.output_schema, path=f"{tool.name}.output_schema"
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid schema for tool {tool.name!r}: {exc}"
+                ) from exc
             self._tools[tool.name] = tool
         self._permission_mode = PermissionMode.ASK
         self.set_permission_mode(permission_mode)
@@ -98,6 +144,13 @@ class ToolExecutor:
         """Restrict or restore the registered tools available to the agent."""
 
         self._allowed_tools = allowed_tools
+
+    def read_only_tool_names(self) -> frozenset[str]:
+        """Return registered tools declared safe for read-only planning."""
+
+        return frozenset(
+            name for name, tool in self._tools.items() if tool.read_only
+        )
 
     def set_permission_mode(self, mode: PermissionMode) -> None:
         """Apply a permission mode to tools and the interactive approval handler."""
@@ -127,6 +180,10 @@ class ToolExecutor:
                 success=False,
                 output=f"unknown tool {tool_name!r}; available tools: {available}",
             )
+        try:
+            validate_value(args, tool._validation_schema(), path="args")
+        except SchemaValidationError as exc:
+            return ToolResult(tool_name, dict(args), False, str(exc))
         external_access = tool.requires_full_access(args)
         if (
             external_access
@@ -160,8 +217,9 @@ class ToolExecutor:
             tool.set_temporary_full_access(True)
         try:
             check_cancelled()
-            output = tool.run(args)
-            return ToolResult(tool_name, dict(args), True, str(output))
+            output = str(tool.run(args))
+            validate_value(output, tool.output_schema, path="output")
+            return ToolResult(tool_name, dict(args), True, output)
         except RunCancelled:
             raise
         except Exception as exc:  # A failed action is data the model can recover from.
