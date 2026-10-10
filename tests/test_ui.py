@@ -158,7 +158,7 @@ class TerminalAppTests(unittest.TestCase):
 
         self.assertIn("MINI AGENT", header)
         self.assertIn("test-model", header)
-        self.assertIn("/tmp/example", header)
+        self.assertIn(str(Path("/tmp/example")), header)
         self.assertIn("o.o", header)
 
     def test_status_line_contains_model_and_workspace(self) -> None:
@@ -331,7 +331,7 @@ class TerminalAppTests(unittest.TestCase):
                 session=session,
             )
             with create_pipe_input() as pipe_input:
-                application = app._create_application(input=pipe_input)
+                application = app._create_application(input=pipe_input, output=DummyOutput())
             assert app._input_field is not None
             app._input_field.text = "inspect files"
 
