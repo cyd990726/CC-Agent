@@ -261,6 +261,11 @@ class ToolTests(unittest.TestCase):
         memory = MemoryStore(self.workspace, root=self.workspace / ".data")
         executor = ToolExecutor([RememberTool(memory), ReadMemoryTool(memory)])
 
+        self.assertEqual(executor.read_only_tool_names(), frozenset({"read_memory"}))
+        for description in executor.describe():
+            self.assertEqual(description["args"]["type"], "object")
+        self.assertFalse(executor.execute("remember", {}).success)
+
         saved = executor.execute(
             "remember", {"content": "Prefer focused regression tests."}
         )

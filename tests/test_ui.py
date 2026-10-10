@@ -60,6 +60,8 @@ class TerminalAppTests(unittest.TestCase):
         app._ui_active = True
         renderer.set_activity_handler(app._update_activity)
         renderer.set_output_handler(app._write_transcript)
+        renderer.set_render_handler(app._append_renderables)
+        renderer.set_block_handler(app._upsert_renderables)
 
     @staticmethod
     def _transcript_text(app: TerminalApp) -> str:
@@ -89,6 +91,7 @@ class TerminalAppTests(unittest.TestCase):
         )
 
         app._reset_transcript_to_header()
+        self.assertEqual(app._transcript_blocks[0].block_id, "session:header")
 
         rendered = "".join(
             text
@@ -139,6 +142,24 @@ class TerminalAppTests(unittest.TestCase):
 
         self.assertFalse(changed)
         self.assertEqual("".join(app._transcript), before)
+
+    def test_header_includes_logo_and_session_metadata(self) -> None:
+        console = Console(file=StringIO(), force_terminal=False)
+        app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=Path("/tmp/example"),
+        )
+
+        console.print(app._header_content())
+        header = console.file.getvalue()
+
+        self.assertIn("MINI AGENT", header)
+        self.assertIn("test-model", header)
+        self.assertIn("/tmp/example", header)
+        self.assertIn("o.o", header)
 
     def test_status_line_contains_model_and_workspace(self) -> None:
         output = StringIO()
@@ -591,6 +612,7 @@ class TerminalAppTests(unittest.TestCase):
         )
         self._attach_renderer(app, renderer)
 
+        renderer(AgentEvent(EventType.RUN_STARTED, {"task": "test"}))
         renderer(
             AgentEvent(
                 EventType.TOOL_REQUESTED,
@@ -613,6 +635,17 @@ class TerminalAppTests(unittest.TestCase):
         rendered_before_close = self._transcript_text(app)
         self.assertNotIn("Explored", rendered_before_close)
         self.assertIn("Read README.md", rendered_before_close)
+        self.assertNotIn("contents", rendered_before_close)
+        self.assertTrue(
+            any(
+                block.block_id is not None
+                and block.block_id.startswith("tool-result:")
+                for block in app._transcript_blocks
+            )
+        )
+
+        app._handle_command("/verbose")
+        self.assertIn("contents", self._transcript_text(app))
 
         renderer.close()
 
@@ -633,6 +666,7 @@ class TerminalAppTests(unittest.TestCase):
         )
         self._attach_renderer(app, renderer)
 
+        renderer(AgentEvent(EventType.RUN_STARTED, {"task": "test"}))
         renderer(
             AgentEvent(
                 EventType.TOOL_REQUESTED,
@@ -677,6 +711,7 @@ class TerminalAppTests(unittest.TestCase):
         assert app._input_field is not None
         app._input_field.text = "正在输入的草稿"
 
+        renderer(AgentEvent(EventType.RUN_STARTED, {"task": "test"}))
         renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
         renderer(
             AgentEvent(
@@ -1025,6 +1060,18 @@ class TerminalAppTests(unittest.TestCase):
             permission_handler=handler,
         )
         handler.set_request_callback(app._request_permission)
+        app.renderer.presentation_store.handle(
+            AgentEvent(EventType.RUN_STARTED, {"task": "test"})
+        )
+        app.renderer.presentation_store.handle(
+            AgentEvent(
+                EventType.TOOL_REQUESTED,
+                {"tool": "shell", "args": {"command": "pwd"}},
+            )
+        )
+        app.renderer.presentation_store.handle(
+            AgentEvent(EventType.TOOL_STARTED, {"tool": "shell"})
+        )
         result: list[bool] = []
         worker = threading.Thread(
             target=lambda: result.append(handler("shell", {"command": "pwd"}))
@@ -1036,11 +1083,21 @@ class TerminalAppTests(unittest.TestCase):
             time.sleep(0.001)
         self.assertTrue(app._activate_permission_request())
         self.assertEqual(app._active_permission.tool_name, "shell")
+        self.assertEqual(
+            len(app.renderer.presentation_store.state.permission_requests),
+            1,
+        )
+        self.assertIsNotNone(app._terminal_view_state.active_permission_id)
         app._resolve_permission("y")
         worker.join(timeout=1)
 
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, [True])
+        self.assertEqual(
+            app.renderer.presentation_store.state.permission_requests,
+            (),
+        )
+        self.assertIsNone(app._terminal_view_state.active_permission_id)
         self.assertEqual(console.file.getvalue(), "")
 
 
@@ -1163,7 +1220,12 @@ class RendererTests(unittest.TestCase):
     def setUp(self) -> None:
         self.FakeLive.instances = []
 
-    def test_edit_result_shows_complete_diff_without_verbose(self) -> None:
+    @staticmethod
+    def _start_model(renderer: TerminalRenderer, step: int = 1) -> None:
+        renderer(AgentEvent(EventType.RUN_STARTED, {"task": "test"}))
+        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": step}))
+
+    def test_edit_result_is_compact_by_default_and_expands_in_verbose(self) -> None:
         import difflib
 
         before = "".join(f"line {index}\n" for index in range(30))
@@ -1172,27 +1234,31 @@ class RendererTests(unittest.TestCase):
         diff = "".join(difflib.unified_diff(
             before.splitlines(keepends=True), after.splitlines(keepends=True),
             fromfile="a/example.py", tofile="b/example.py"))
-        for interactive in (False, True):
-            with self.subTest(interactive=interactive):
+        for verbose in (False, True):
+            with self.subTest(verbose=verbose):
                 output = StringIO()
                 renderer = TerminalRenderer(Console(
-                    file=output, force_terminal=False, width=100))
-                chunks = []
-                if interactive:
-                    renderer.set_output_handler(chunks.append)
+                    file=output, force_terminal=False, width=100),
+                    verbose=verbose,
+                )
                 renderer(AgentEvent(EventType.TOOL_COMPLETED, {"result": {
                     "tool": "edit_file", "success": True,
                     "output": "updated example.py\n" + diff,
                 }}))
-                rendered = "".join(chunks) if interactive else output.getvalue()
+                rendered = output.getvalue()
                 self.assertIn("+2 / -2 lines", rendered)
                 for line in diff.splitlines()[2:]:
-                    self.assertIn(line, rendered)
-                self.assertNotIn("/verbose", rendered)
+                    if verbose:
+                        self.assertIn(line, rendered)
+                    else:
+                        self.assertNotIn(line, rendered)
                 self.assertNotIn("--- a/example.py", rendered)
 
     def test_edit_diff_colors_and_newline_marker(self) -> None:
-        renderer = TerminalRenderer(Console(file=StringIO(), force_terminal=False))
+        renderer = TerminalRenderer(
+            Console(file=StringIO(), force_terminal=False),
+            verbose=True,
+        )
         rows = []
         renderer.set_render_handler(lambda objects, options: rows.extend(objects))
         renderer(AgentEvent(EventType.TOOL_COMPLETED, {"result": {
@@ -1213,7 +1279,7 @@ class RendererTests(unittest.TestCase):
         output = StringIO()
         renderer = TerminalRenderer(Console(file=output, force_terminal=False))
         answer = "\n\nFirst paragraph.\n\nTAIL remains intact."
-        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        self._start_model(renderer)
         renderer(AgentEvent(EventType.MODEL_DELTA, {
             "delta": json.dumps({"final_answer": answer}),
         }))
@@ -1255,6 +1321,7 @@ class RendererTests(unittest.TestCase):
         renderer = TerminalRenderer(Console(file=output, force_terminal=False))
         renderer.set_output_handler(chunks.append)
 
+        renderer(AgentEvent(EventType.RUN_STARTED, {"task": "test"}))
         renderer(
             AgentEvent(
                 EventType.RUN_COMPLETED,
@@ -1271,7 +1338,7 @@ class RendererTests(unittest.TestCase):
         console = Console(file=output, force_terminal=False)
         renderer = TerminalRenderer(console)
 
-        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 4}))
+        self._start_model(renderer, step=4)
 
         self.assertIsNotNone(renderer._status)
         assert renderer._status is not None
@@ -1287,7 +1354,7 @@ class RendererTests(unittest.TestCase):
         output = StringIO()
         renderer = TerminalRenderer(Console(file=output, force_terminal=False))
 
-        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        self._start_model(renderer)
         renderer(
             AgentEvent(
                 EventType.MODEL_DELTA,
@@ -1313,7 +1380,7 @@ class RendererTests(unittest.TestCase):
         output = StringIO()
         renderer = TerminalRenderer(Console(file=output, force_terminal=False))
 
-        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        self._start_model(renderer)
         renderer(
             AgentEvent(
                 EventType.MODEL_DELTA,
@@ -1341,7 +1408,7 @@ class RendererTests(unittest.TestCase):
         output = StringIO()
         renderer = TerminalRenderer(Console(file=output, force_terminal=False))
 
-        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        self._start_model(renderer)
         renderer(
             AgentEvent(
                 EventType.MODEL_DELTA,
@@ -1373,6 +1440,7 @@ class RendererTests(unittest.TestCase):
             )
         )
 
+        self._start_model(renderer)
         renderer(
             AgentEvent(
                 EventType.MODEL_DELTA,
@@ -1485,6 +1553,7 @@ class RendererTests(unittest.TestCase):
             live_factory=self.FakeLive,
         )
 
+        self._start_model(renderer)
         renderer(
             AgentEvent(
                 EventType.MODEL_DELTA,
@@ -1511,7 +1580,7 @@ class RendererTests(unittest.TestCase):
         )
         answer = "\n\n".join(f"唯一行-{index}" for index in range(40))
 
-        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        self._start_model(renderer)
         renderer(
             AgentEvent(
                 EventType.MODEL_DELTA,
@@ -1680,6 +1749,7 @@ class RendererTests(unittest.TestCase):
                 renderer = TerminalRenderer(console, live_factory=self.FakeLive)
                 if interactive:
                     renderer.set_activity_handler(lambda *_: None)
+                renderer(AgentEvent(EventType.RUN_STARTED, {"task": "test"}))
                 for tool, path, thought in (
                     ("list_files", "agent/", "Inspecting the runtime next."),
                     ("read_file", "agent/runtime.py", "Found the relevant logic."),

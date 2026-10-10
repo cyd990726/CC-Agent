@@ -168,6 +168,7 @@ mini-agent --no-confirm
 列出最近会话、`/memories` 查看项目记忆、`/remember ...` 保存一条项目记忆。
 输入 `/` 会打开命令面板，可用 `Tab` 选择；`Shift+Tab` 可在
 Ask for approval、Accept edits、Full Access 和 Plan mode 之间快速切换。
+`Ctrl+O` 可展开或折叠最近的工具结果，`Ctrl+End` 返回最新输出。
 输入框下方右侧会显示当前模式；Ask for approval 状态下不显示模式标签。
 长输入会自动折行并增高输入框，`Alt+Enter` 或 `Ctrl+J` 可以主动换行。`/plan` 可在
 会话中切换只读计划模式并在关闭时恢复原权限；Plan mode 下通过 `/permissions`

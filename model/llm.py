@@ -85,6 +85,7 @@ class LLM(ABC):
         messages: Sequence[Mapping[str, str]],
         tools: Sequence[Mapping[str, Any]],
         on_delta: Callable[[str], None] | None = None,
+        on_usage: Callable[[TokenUsage], None] | None = None,
     ) -> Mapping[str, Any]:
         """Extension point for adapters with native tool calling support.
 
@@ -97,6 +98,7 @@ class LLM(ABC):
         return self.stream_chat(
             messages,
             on_delta=on_delta,
+            on_usage=on_usage,
         )
 
 

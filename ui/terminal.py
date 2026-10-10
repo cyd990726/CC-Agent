@@ -56,6 +56,21 @@ from ui.logo import LOGO_ANIMATION_FRAMES, render_logo
 from ui.renderer import TerminalRenderer
 from ui.transcript import TranscriptBlock
 from ui.selection import TranscriptSelectionControl, copy_to_clipboard
+from ui.view_model import (
+    ContentArrived,
+    FocusBlock,
+    FollowTail,
+    HidePermission,
+    PermissionChoiceViewModel,
+    ResizeTerminal,
+    ScrollAway,
+    SetExpandedBlocks,
+    SelectPermission,
+    ShowPermission,
+    TerminalViewState,
+    ToggleBlock,
+    reduce_terminal,
+)
 
 
 COMMANDS = (
@@ -81,6 +96,8 @@ class _PermissionRequest:
     args: dict[str, Any]
     ready: threading.Event
     answer: str = "n"
+    presentation_request_id: str | None = None
+    call_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -263,6 +280,9 @@ INPUT_STYLE = Style.from_dict(
 class TerminalApp:
     """Run multiple independent agent tasks in one terminal session."""
 
+    MAX_TRANSCRIPT_BLOCKS = 500
+    TRIM_TRANSCRIPT_BLOCKS = 50
+
     def __init__(
         self,
         runtime: AgentRuntime,
@@ -305,6 +325,9 @@ class TerminalApp:
         self._transcript: list[str] = []
         self._transcript_blocks: list[TranscriptBlock] = []
         self._transcript_width = console.width
+        self._terminal_view_state = TerminalViewState(
+            transcript_width=max(1, console.width)
+        )
         self._transcript_styled: list[tuple[str, str]] = []
         self._transcript_line_fragments: tuple[tuple[tuple[str, str], ...], ...] = (
             ((),)
@@ -312,6 +335,8 @@ class TerminalApp:
         self._transcript_lines = 1
         self._transcript_cursor_line: int | None = None
         self._streaming_block_index: int | None = None
+        self._trimmed_transcript_blocks = 0
+        self._unseen_block_ids: set[str] = set()
         self._active_permission: _PermissionRequest | None = None
         self._permission_selection = len(PERMISSION_OPTIONS) - 1
         self._mode_selector_open = False
@@ -331,6 +356,9 @@ class TerminalApp:
         self._exit_requested = False
         self._closing = False
         self._active_cancellation: CancellationToken | None = None
+        self.renderer.presentation_store.set_permission_mode(
+            self._current_permission_mode().value
+        )
 
     def run(self) -> int:
         if not self._uses_terminal_prompt:
@@ -371,6 +399,7 @@ class TerminalApp:
         self.renderer.set_output_handler(self._write_transcript)
         self.renderer.set_render_handler(self._append_renderables)
         self.renderer.set_stream_render_handler(self._update_streaming_renderables)
+        self.renderer.set_block_handler(self._upsert_renderables)
         if self.permission_handler is not None:
             self.permission_handler.set_request_callback(
                 self._request_permission
@@ -411,6 +440,7 @@ class TerminalApp:
             self.renderer.set_output_handler(None)
             self.renderer.set_render_handler(None)
             self.renderer.set_stream_render_handler(None)
+            self.renderer.set_block_handler(None)
             if self.permission_handler is not None:
                 self.permission_handler.set_request_callback(None)
             self._application = None
@@ -425,14 +455,20 @@ class TerminalApp:
         if self._active_permission is not None:
             request = self._active_permission
             self._active_permission = None
+            self._resolve_presentation_permission(request, "n")
             request.answer = "n"
             request.ready.set()
             self._permission_requests.task_done()
+            self._terminal_view_state = reduce_terminal(
+                self._terminal_view_state,
+                HidePermission(),
+            )
         while True:
             try:
                 request = self._permission_requests.get_nowait()
             except queue.Empty:
                 return
+            self._resolve_presentation_permission(request, "n")
             request.answer = "n"
             request.ready.set()
             self._permission_requests.task_done()
@@ -444,6 +480,7 @@ class TerminalApp:
         turn_index: int | None = None,
         recorded: bool = False,
     ) -> None:
+        self.renderer.presentation_store.queue_task(task)
         with self._state_lock:
             was_busy = self._pending_tasks > 0
             self._pending_tasks += 1
@@ -538,6 +575,18 @@ class TerminalApp:
                 and self._active_cancellation.event.is_set()
             ):
                 return "n"
+            choices = tuple(
+                PermissionChoiceViewModel(value, label, description)
+                for value, label, description in permission_choices(tool_name)
+            )
+            presentation = self.renderer.presentation_store.request_permission(
+                tool_name,
+                args,
+                choices,
+            )
+            if presentation is not None:
+                request.presentation_request_id = presentation.request_id
+                request.call_id = presentation.call_id
             self._permission_requests.put(request)
             invalidate = self._invalidate_input
         if invalidate is not None:
@@ -867,6 +916,7 @@ class TerminalApp:
                 self.plan_mode = False
                 self._permission_mode_before_plan = None
                 self.runtime.set_permission_mode(mode)
+                self.renderer.presentation_store.set_permission_mode(mode.value)
                 self.runtime.set_plan_mode(False)
                 self._print_message(
                     f"[bright_black]计划模式已关闭，恢复为"
@@ -892,6 +942,7 @@ class TerminalApp:
                     mode_changed = mode is not self.runtime.permission_mode
                     plan_was_active = self.plan_mode
                     self.runtime.set_permission_mode(mode)
+                    self.renderer.presentation_store.set_permission_mode(mode.value)
                     if plan_was_active:
                         self.plan_mode = False
                         self._permission_mode_before_plan = None
@@ -930,6 +981,11 @@ class TerminalApp:
                     self._transcript_lines = 1
                     self._transcript_cursor_line = None
                     self._streaming_block_index = None
+                    self._trimmed_transcript_blocks = 0
+                    self._unseen_block_ids.clear()
+                    self._terminal_view_state = TerminalViewState(
+                        transcript_width=self._transcript_width
+                    )
                 if self._transcript_window is not None:
                     self._transcript_window.follow_bottom()
                 self._invalidate()
@@ -952,6 +1008,19 @@ class TerminalApp:
                     )
         elif normalized == "/verbose":
             enabled = self.renderer.toggle_verbose()
+            with self._state_lock:
+                expandable = frozenset(
+                    block.block_id
+                    for block in self._transcript_blocks
+                    if block.block_id is not None and block.expandable
+                )
+                self._terminal_view_state = reduce_terminal(
+                    self._terminal_view_state,
+                    SetExpandedBlocks(expandable, enabled),
+                )
+                if self._transcript_blocks:
+                    self._reflow_transcript(self._transcript_width)
+            self._invalidate()
             label = "开启" if enabled else "关闭"
             self._print_message(
                 f"[bright_black]完整工具输出已{label}。[/]"
@@ -1023,6 +1092,10 @@ class TerminalApp:
             table.add_row("Tokens", self._format_usage_detail(self._session_usage()))
         if self.memory is not None:
             table.add_row("Memory", self._display_path(self.memory.entrypoint))
+        table.add_row(
+            "Queued",
+            str(len(self.renderer.presentation_store.state.queued_turn_ids)),
+        )
         self._print_message(
             Panel.fit(
                 table,
@@ -1110,7 +1183,7 @@ class TerminalApp:
             self._print_message(history)
             return
         self._refresh_header_frame()
-        header_block = TranscriptBlock((self._header_content(),))
+        header_block = TranscriptBlock((self._header_content(),), block_id="session:header")
         header_text = header_block.render(
             self._transcript_width,
             self.console.color_system,
@@ -1625,6 +1698,18 @@ class TerminalApp:
             self._transcript_cursor_line = None
             if self._transcript_window is not None:
                 self._transcript_window.follow_bottom()
+            with self._state_lock:
+                self._terminal_view_state = reduce_terminal(
+                    self._terminal_view_state,
+                    FollowTail(),
+                )
+                self._unseen_block_ids.clear()
+            event.app.invalidate()
+
+        @bindings.add("c-o")
+        def toggle_focused_transcript_block(event) -> None:
+            if not self._overlay_visible():
+                self._toggle_focused_block()
             event.app.invalidate()
 
         return bindings
@@ -1659,6 +1744,12 @@ class TerminalApp:
         return True
 
     def _scroll_transcript(self, offset: int) -> None:
+        if offset < 0:
+            with self._state_lock:
+                self._terminal_view_state = reduce_terminal(
+                    self._terminal_view_state,
+                    ScrollAway(None),
+                )
         window = self._transcript_window
         if window is not None and window.render_info is not None:
             window.scroll_rows(offset)
@@ -1675,9 +1766,39 @@ class TerminalApp:
             self._transcript_cursor_line = (
                 None if target >= last_line else target
             )
+            if self._transcript_cursor_line is None:
+                self._terminal_view_state = reduce_terminal(
+                    self._terminal_view_state,
+                    FollowTail(),
+                )
+                self._unseen_block_ids.clear()
             invalidate = self._invalidate_input
         if invalidate is not None:
             invalidate()
+
+    def _toggle_focused_block(self) -> bool:
+        with self._state_lock:
+            expandable = [
+                block.block_id
+                for block in self._transcript_blocks
+                if block.block_id is not None and block.expandable
+            ]
+            if not expandable:
+                return False
+            focused = self._terminal_view_state.focused_block_id
+            if focused not in expandable:
+                focused = expandable[-1]
+                self._terminal_view_state = reduce_terminal(
+                    self._terminal_view_state,
+                    FocusBlock(focused),
+                )
+            self._terminal_view_state = reduce_terminal(
+                self._terminal_view_state,
+                ToggleBlock(focused),
+            )
+            self._reflow_transcript(self._transcript_width)
+        self._invalidate()
+        return True
 
     async def _refresh_ui(self) -> None:
         while True:
@@ -1698,35 +1819,80 @@ class TerminalApp:
             return False
         self._active_permission = request
         self._permission_selection = len(PERMISSION_OPTIONS) - 1
+        if request.presentation_request_id is not None:
+            self._terminal_view_state = reduce_terminal(
+                self._terminal_view_state,
+                ShowPermission(request.presentation_request_id),
+            )
+            self._terminal_view_state = reduce_terminal(
+                self._terminal_view_state,
+                SelectPermission(self._permission_selection),
+            )
         if self._selection_control is not None:
             self._selection_control.clear_selection()
         self._copy_notice = ""
         if self.permission_handler is not None and self._ui_active:
-            self._print_message(
-                self.permission_handler.request_panel(request.tool_name, request.args)
+            panel = self.permission_handler.request_panel(
+                request.tool_name,
+                request.args,
             )
+            if request.presentation_request_id is not None:
+                self._upsert_renderables(
+                    f"permission:{request.presentation_request_id}",
+                    (panel,),
+                )
+            else:
+                self._print_message(panel)
             self._transcript_cursor_line = None
             if self._transcript_window is not None:
                 self._transcript_window.follow_bottom()
+            with self._state_lock:
+                self._terminal_view_state = reduce_terminal(
+                    self._terminal_view_state,
+                    FollowTail(),
+                )
+                self._unseen_block_ids.clear()
         return True
 
     def _resolve_permission(self, answer: str) -> None:
         request = self._active_permission
         if request is None:
             return
+        self._resolve_presentation_permission(request, answer)
         request.answer = answer
         self._active_permission = None
+        self._terminal_view_state = reduce_terminal(
+            self._terminal_view_state,
+            HidePermission(),
+        )
         request.ready.set()
         self._permission_requests.task_done()
         self._activate_permission_request()
         if self._application is not None and self._input_field is not None:
             self._application.layout.focus(self._input_field)
 
+    def _resolve_presentation_permission(
+        self,
+        request: _PermissionRequest,
+        answer: str,
+    ) -> None:
+        if request.presentation_request_id is None or request.call_id is None:
+            return
+        self.renderer.presentation_store.resolve_permission(
+            request.presentation_request_id,
+            request.call_id,
+            allowed=answer.strip().lower() in {"y", "yes", "a", "always"},
+        )
+
     def _move_overlay(self, offset: int) -> None:
         if self._active_permission is not None:
             self._permission_selection = (
                 self._permission_selection + offset
             ) % len(PERMISSION_OPTIONS)
+            self._terminal_view_state = reduce_terminal(
+                self._terminal_view_state,
+                SelectPermission(self._permission_selection),
+            )
         elif self._mode_selector_open:
             self._mode_selection = (
                 self._mode_selection + offset
@@ -1739,6 +1905,7 @@ class TerminalApp:
     def _confirm_mode(self) -> None:
         mode = list(PermissionMode)[self._mode_selection]
         self.runtime.set_permission_mode(mode)
+        self.renderer.presentation_store.set_permission_mode(mode.value)
         if self.permission_handler is not None:
             self.permission_handler.set_mode(mode)
         if self.plan_mode:
@@ -1766,6 +1933,12 @@ class TerminalApp:
         self._transcript_cursor_line = None
         if self._transcript_window is not None:
             self._transcript_window.follow_bottom()
+        with self._state_lock:
+            self._terminal_view_state = reduce_terminal(
+                self._terminal_view_state,
+                FollowTail(),
+            )
+            self._unseen_block_ids.clear()
         if task.startswith("/"):
             self._print_message(
                 Text.assemble(
@@ -1885,6 +2058,10 @@ class TerminalApp:
         with self._state_lock:
             width = get_app().output.get_size().columns
             if self._transcript_blocks and width != self._transcript_width:
+                self._terminal_view_state = reduce_terminal(
+                    self._terminal_view_state,
+                    ResizeTerminal(width),
+                )
                 self._reflow_transcript(width)
             fragments = tuple(self._transcript_styled)
         return FormattedText(fragments)
@@ -1899,11 +2076,32 @@ class TerminalApp:
     def _append_renderables(self, objects, options=None) -> None:
         block = TranscriptBlock(tuple(objects), options or {})
         with self._state_lock:
+            browsing = self._is_browsing_locked()
             self._transcript_blocks.append(block)
-            text = block.render(self._transcript_width, self.console.color_system)
-            styled = list(to_formatted_text(ANSI(text)))
-            self._transcript.append(text)
-            self._transcript_styled.extend(styled)
+            if browsing:
+                if self._terminal_view_state.follow_tail:
+                    self._terminal_view_state = reduce_terminal(
+                        self._terminal_view_state,
+                        ScrollAway(None),
+                    )
+                self._terminal_view_state = reduce_terminal(
+                    self._terminal_view_state,
+                    ContentArrived(),
+                )
+            if self._trim_transcript_locked():
+                self._reflow_transcript(self._transcript_width)
+            else:
+                text = block.render(
+                    self._transcript_width,
+                    self.console.color_system,
+                )
+                styled = list(to_formatted_text(ANSI(text)))
+                self._transcript.append(text)
+                self._transcript_styled.extend(styled)
+                self._transcript_lines += max(
+                    0,
+                    self._fragment_line_count(styled) - 1,
+                )
             self._rebuild_transcript_line_cache()
         self._invalidate()
 
@@ -1930,13 +2128,126 @@ class TerminalApp:
                 self._streaming_block_index = None
         self._invalidate()
 
+    def _upsert_renderables(
+        self,
+        block_id,
+        compact_objects,
+        expanded_objects=None,
+        options=None,
+    ) -> None:
+        block = TranscriptBlock(
+            tuple(compact_objects),
+            options or {},
+            block_id=block_id,
+            expanded_objects=(
+                tuple(expanded_objects) if expanded_objects is not None else None
+            ),
+        )
+        with self._state_lock:
+            browsing = self._is_browsing_locked()
+            for index, existing in enumerate(self._transcript_blocks):
+                if existing.block_id == block_id:
+                    self._transcript_blocks[index] = block
+                    break
+            else:
+                self._transcript_blocks.append(block)
+            if browsing and block_id not in self._unseen_block_ids:
+                self._unseen_block_ids.add(block_id)
+                if self._terminal_view_state.follow_tail:
+                    self._terminal_view_state = reduce_terminal(
+                        self._terminal_view_state,
+                        ScrollAway(None),
+                    )
+                self._terminal_view_state = reduce_terminal(
+                    self._terminal_view_state,
+                    ContentArrived(),
+                )
+            if block.expandable:
+                self._terminal_view_state = reduce_terminal(
+                    self._terminal_view_state,
+                    FocusBlock(block_id),
+                )
+            if self.renderer.verbose and block.expandable:
+                self._terminal_view_state = reduce_terminal(
+                    self._terminal_view_state,
+                    SetExpandedBlocks(frozenset({block_id}), True),
+                )
+            self._trim_transcript_locked()
+            self._reflow_transcript(self._transcript_width)
+        self._invalidate()
+
+    def _is_browsing_locked(self) -> bool:
+        return (
+            not self._terminal_view_state.follow_tail
+            or self._transcript_cursor_line is not None
+            or (
+                self._transcript_window is not None
+                and self._transcript_window._view_anchor is not None
+            )
+        )
+
+    def _trim_transcript_locked(self) -> bool:
+        maximum = max(3, self.MAX_TRANSCRIPT_BLOCKS)
+        blocks = self._transcript_blocks
+        if len(blocks) <= maximum:
+            return False
+        header = [blocks[0]] if blocks[0].block_id == "session:header" else []
+        candidates = [
+            block for block in blocks[len(header) :]
+            if block.block_id != "session:trimmed"
+        ]
+        capacity = maximum - len(header) - 1
+        headroom = min(self.TRIM_TRANSCRIPT_BLOCKS, max(0, capacity - 1))
+        keep_count = max(1, capacity - headroom)
+        kept = candidates[-keep_count:]
+        dropped = max(0, len(candidates) - len(kept))
+        if dropped == 0:
+            return False
+        self._trimmed_transcript_blocks += dropped
+        notice = TranscriptBlock(
+            (
+                Text(
+                    f"… {self._trimmed_transcript_blocks:,} older transcript "
+                    "blocks omitted",
+                    style="bright_black",
+                ),
+            ),
+            block_id="session:trimmed",
+        )
+        self._transcript_blocks = [*header, notice, *kept]
+        existing_ids = {
+            block.block_id
+            for block in self._transcript_blocks
+            if block.block_id is not None
+        }
+        stale_expanded = self._terminal_view_state.expanded_block_ids - existing_ids
+        if stale_expanded:
+            self._terminal_view_state = reduce_terminal(
+                self._terminal_view_state,
+                SetExpandedBlocks(stale_expanded, False),
+            )
+        if self._terminal_view_state.focused_block_id not in existing_ids:
+            self._terminal_view_state = reduce_terminal(
+                self._terminal_view_state,
+                FocusBlock(None),
+            )
+        self._unseen_block_ids.intersection_update(existing_ids)
+        return True
+
     def _reflow_transcript(self, width: int) -> None:
         """Called under the state lock: publish one consistent resized snapshot."""
         window = self._transcript_window
         anchor = window._view_anchor if window is not None else None
         old_counts = [text.count("\n") for text in self._transcript]
-        chunks = [block.render(width, self.console.color_system)
-                  for block in self._transcript_blocks]
+        expanded = self._terminal_view_state.expanded_block_ids
+        chunks = [
+            block.render(
+                width,
+                self.console.color_system,
+                expanded=block.block_id in expanded,
+            )
+            for block in self._transcript_blocks
+        ]
         # Keep the reader in the same source block when its rendered height changes.
         if anchor is not None:
             old_top = new_top = 0
@@ -1962,7 +2273,7 @@ class TerminalApp:
             to_formatted_text(ANSI(self._header_markup))
         )
         self._rebuild_transcript_line_cache()
-        self._transcript_blocks = [TranscriptBlock((self._header_content(),))]
+        self._transcript_blocks = [TranscriptBlock((self._header_content(),), block_id="session:header")]
 
     def _advance_header_animation(self) -> bool:
         if not self._ui_active or len(self._transcript_blocks) != 1:
@@ -1972,7 +2283,7 @@ class TerminalApp:
             return False
         self._header_frame = (self._header_frame + 1) % len(LOGO_ANIMATION_FRAMES)
         self._last_header_frame_at = now
-        header_block = TranscriptBlock((self._header_content(self._header_frame),))
+        header_block = TranscriptBlock((self._header_content(self._header_frame),), block_id="session:header")
         header_text = header_block.render(
             self._transcript_width,
             self.console.color_system,
@@ -2172,15 +2483,39 @@ class TerminalApp:
         with self._state_lock:
             message = self._activity_message
             started_at = self._activity_started_at
-            browsing = self._transcript_cursor_line is not None or (
-                self._transcript_window is not None
-                and self._transcript_window._view_anchor is not None
+            browsing = (
+                not self._terminal_view_state.follow_tail
+                or self._transcript_cursor_line is not None
+                or (
+                    self._transcript_window is not None
+                    and self._transcript_window._view_anchor is not None
+                )
             )
+            if not browsing and not self._terminal_view_state.follow_tail:
+                self._terminal_view_state = reduce_terminal(
+                    self._terminal_view_state,
+                    FollowTail(),
+                )
+                self._unseen_block_ids.clear()
+            unseen = self._terminal_view_state.unseen_count
         if browsing:
-            return self._activity_line_fragments(
-                "  正在查看历史 · Ctrl+End 返回最新内容",
-                "class:session-status",
+            unseen_label = f" · {unseen} 条新内容" if unseen else ""
+            return FormattedText([("class:session-status", self._truncate_cells(
+                f"  正在查看历史{unseen_label} · Ctrl+End 返回最新内容",
                 width,
+            ))])
+        queued = len(self.renderer.presentation_store.state.queued_turn_ids)
+        if message is None and queued:
+            return FormattedText(
+                [
+                    (
+                        "class:session-status",
+                        self._truncate_cells(
+                            f"  {queued} 个任务排队中",
+                            width,
+                        ),
+                    )
+                ]
             )
         if message is None or started_at is None:
             return self._activity_line_fragments("", "class:session-status", width)
@@ -2377,6 +2712,7 @@ class TerminalApp:
             mode = self._current_permission_mode()
 
         self.runtime.set_permission_mode(mode)
+        self.renderer.presentation_store.set_permission_mode(mode.value)
         self.runtime.set_plan_mode(self.plan_mode)
 
     def _current_permission_mode(self) -> PermissionMode:

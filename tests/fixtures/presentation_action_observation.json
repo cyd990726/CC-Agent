@@ -1,0 +1,96 @@
+[
+  {
+    "type": "run_started",
+    "data": {
+      "task": "inspect the login flow"
+    }
+  },
+  {
+    "type": "model_started",
+    "data": {
+      "step": 1
+    }
+  },
+  {
+    "type": "model_completed",
+    "data": {
+      "step": 1,
+      "response": {
+        "thought": "I will inspect the authentication module.",
+        "action": {
+          "tool": "read_file",
+          "args": {
+            "path": "src/auth.py"
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "tool_requested",
+    "data": {
+      "tool": "read_file",
+      "args": {
+        "path": "src/auth.py",
+        "offset": 1,
+        "limit": 2
+      }
+    }
+  },
+  {
+    "type": "tool_started",
+    "data": {
+      "tool": "read_file",
+      "args": {
+        "path": "src/auth.py"
+      }
+    }
+  },
+  {
+    "type": "tool_completed",
+    "data": {
+      "result": {
+        "tool": "read_file",
+        "args": {
+          "path": "src/auth.py"
+        },
+        "success": true,
+        "output": "[lines 1-2 of 2]\ndef login():\n    pass"
+      }
+    }
+  },
+  {
+    "type": "model_started",
+    "data": {
+      "step": 2
+    }
+  },
+  {
+    "type": "model_delta",
+    "data": {
+      "delta": "{\"final_answer\":\"Fixed"
+    }
+  },
+  {
+    "type": "model_delta",
+    "data": {
+      "delta": " the issue.\"}"
+    }
+  },
+  {
+    "type": "model_completed",
+    "data": {
+      "step": 2,
+      "response": {
+        "final_answer": "Fixed the issue."
+      }
+    }
+  },
+  {
+    "type": "run_completed",
+    "data": {
+      "answer": "Fixed the issue.",
+      "steps": 2
+    }
+  }
+]

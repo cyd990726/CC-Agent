@@ -62,7 +62,7 @@ class ToolAwareQueueLLM(QueueLLM):
         super().__init__(responses)
         self.tools: list[Mapping[str, Any]] = []
 
-    def stream_chat_with_tools(self, messages, tools, on_delta=None):
+    def stream_chat_with_tools(self, messages, tools, on_delta=None, on_usage=None):
         self.tools = list(tools)
         return self.stream_chat(messages, on_delta=on_delta)
 

@@ -84,6 +84,11 @@ class CancellationTests(unittest.TestCase):
         self.assertEqual(app._pending_tasks, 0)
         self.assertIn("当前任务已取消", console.file.getvalue())
         self.assertIn("second finished", console.file.getvalue())
+        self.assertEqual(app.renderer.presentation_store.state.queued_turn_ids, ())
+        self.assertEqual(
+            [turn.phase.value for turn in app.renderer.presentation_store.state.turns],
+            ["cancelled", "completed"],
+        )
 
     def test_cancelled_permission_does_not_run_tool_or_retry_model(self):
         token = CancellationToken()
