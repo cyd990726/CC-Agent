@@ -82,7 +82,8 @@ class InteractionTests(unittest.TestCase):
         fake_app.output.get_size.return_value.columns = 80
         with patch("ui.terminal.get_app", return_value=fake_app):
             activity = fragment_list_to_text(app._activity_fragments())
-        self.assertIn("2 条新内容", activity)
+        self.assertEqual(app._terminal_view_state.unseen_count, 2)
+        self.assertEqual(activity, "")
 
     def test_transcript_budget_keeps_recent_blocks_and_notice(self):
         app = self.make_app()
@@ -311,6 +312,32 @@ class InteractionTests(unittest.TestCase):
                 self.assertLessEqual(get_cwidth(text), width)
                 if width >= len("full access on"):
                     self.assertIn("full access on", text)
+
+    def test_enter_submission_renders_task_once_and_executes_once(self):
+        from agent.state import AgentState
+        from prompt_toolkit.widgets import TextArea
+
+        app = self.make_app()
+        app._ui_active = True
+        app.renderer.set_block_handler(app._upsert_renderables)
+        task = "总结一下当前分支的改动"
+        input_field = TextArea(text=task)
+
+        def run(task, **kwargs):
+            kwargs["on_event"](AgentEvent(EventType.RUN_STARTED, {"task": task}))
+            return AgentState(current_task=task)
+
+        app.runtime.run.side_effect = run
+        app._submit_input(input_field, Mock())
+        app._task_queue.put(None)
+        app._task_worker()
+
+        app.runtime.run.assert_called_once()
+        self.assertEqual(app.runtime.run.call_args.args[0], task)
+        self.assertEqual(input_field.text, "")
+        rendered = fragment_list_to_text(app._transcript_styled)
+        self.assertEqual(rendered.count(task), 1)
+        self.assertEqual(app.history, [task])
 
     def test_unexpected_task_error_does_not_kill_queue_worker(self):
         app = self.make_app()

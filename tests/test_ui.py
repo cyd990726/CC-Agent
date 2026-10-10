@@ -249,6 +249,41 @@ class TerminalAppTests(unittest.TestCase):
 
         self.assertTrue(rendered.endswith(" 1.2k tokens "))
 
+    def test_activity_remains_visible_while_browsing_history(self) -> None:
+        from dataclasses import replace
+
+        console = Console(file=StringIO(), force_terminal=False)
+        app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=Path("/tmp/example"),
+        )
+        fake_app = Mock()
+        fake_app.output.get_size.return_value.columns = 100
+        app._terminal_view_state = replace(
+            app._terminal_view_state, follow_tail=False, unseen_count=5
+        )
+        app._transcript_cursor_line = 0
+        app._transcript_window = Mock()
+        app._transcript_window._view_anchor = object()
+        app._update_activity("Reading files", time.monotonic() - 3)
+
+        with patch("ui.terminal.get_app", return_value=fake_app):
+            for selecting in (False, True):
+                with self.subTest(selecting=selecting):
+                    app._selection_control = Mock() if selecting else None
+                    text = "".join(part for _style, part in app._activity_fragments())
+                    self.assertIn("Reading files", text)
+                    self.assertNotIn("正在查看历史", text)
+                    self.assertNotIn("条新内容", text)
+                    self.assertNotIn("复制", text)
+            app._selection_control = None
+            app._update_activity(None, None)
+            text = "".join(part for _style, part in app._activity_fragments())
+            self.assertEqual(text, "")
+
     def test_first_task_updates_session_title_before_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1305,6 +1340,8 @@ class RendererTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertLess(rendered.index("Read README.md"), rendered.index("模型响应格式异常"))
         self.assertNotIn("Failed", rendered)
+        self.assertIn("model did not return valid JSON", rendered)
+        self.assertFalse(renderer.verbose)
         self.assertIsNone(renderer._exploration)
 
     def test_toggle_verbose(self) -> None:

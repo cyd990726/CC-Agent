@@ -126,8 +126,8 @@ class TerminalRenderer:
         console: Console,
         *,
         verbose: bool = False,
-        output_limit: int = 1200,
-        output_lines: int = 10,
+        output_limit: int = 600,
+        output_lines: int = 3,
         live_factory: type[Live] = Live,
         presentation_store: PresentationStore | None = None,
     ) -> None:
@@ -813,8 +813,7 @@ class TerminalRenderer:
             self._print(
                 Text("• 模型响应格式异常，正在重试…", style="yellow")
             )
-            if self.verbose:
-                self._print(Text(f"  {output}", style=MUTED))
+            self._print(Text(f"  {output}", style=MUTED))
             return
         args = result.get("args", {})
         args = args if isinstance(args, Mapping) else {}

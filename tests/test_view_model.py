@@ -430,6 +430,27 @@ class PresenterTests(unittest.TestCase):
         self.assertEqual(presented.summary, "Exited with code 0")
         self.assertEqual(dict(presented.metrics), {"exit_code": 0})
 
+    def test_default_preview_collapses_and_expansion_preserves_output(self) -> None:
+        presenters = ToolPresenterRegistry()
+        output = "\n".join(f"line {index}" for index in range(20))
+        result = ToolResult("custom", {}, True, output)
+        compact = presenters.result(result)
+        self.assertEqual(compact.preview[:3], ("line 0", "line 1", "line 2"))
+        self.assertEqual(len(compact.preview), 4)
+        self.assertTrue(compact.truncated)
+        self.assertEqual(presenters.result(result, expanded=True).preview, tuple(output.splitlines()))
+
+    def test_shell_failure_previews_stderr_before_long_stdout(self) -> None:
+        result = ToolResult("shell", {}, False, json.dumps({
+            "exit_code": 1,
+            "stdout": "\n".join(f"log {index}" for index in range(20)),
+            "stderr": "Error: missing configuration",
+        }))
+        compact = ToolPresenterRegistry().result(result)
+        self.assertEqual(compact.preview[0], "Error: missing configuration")
+        self.assertEqual(compact.summary, "Exited with code 1")
+        self.assertTrue(compact.truncated)
+
     def test_unknown_tool_has_generic_fallback(self) -> None:
         request = self.presenters.request("custom", {"value": 3})
         result = self.presenters.result(ToolResult("custom", {}, True, "ok"))
@@ -447,7 +468,7 @@ class PresenterTests(unittest.TestCase):
         self.assertEqual(result.preview[:3], ("one", "two", "three"))
         self.assertEqual(
             result.preview[-1],
-            "… 1 more line · /verbose to expand",
+            "… 1 more line · Ctrl+O / /verbose to expand",
         )
         self.assertTrue(result.truncated)
 

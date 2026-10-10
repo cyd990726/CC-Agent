@@ -245,10 +245,10 @@ class _BasePresenter:
         if omitted_lines:
             noun = "line" if omitted_lines == 1 else "lines"
             visible.append(
-                f"… {omitted_lines:,} more {noun} · /verbose to expand"
+                f"… {omitted_lines:,} more {noun} · Ctrl+O / /verbose to expand"
             )
         elif character_clipped:
-            visible.append("… output truncated · /verbose to expand")
+            visible.append("… output truncated · Ctrl+O / /verbose to expand")
         return tuple(visible)
 
     def _is_truncated(self, value: str, *, expanded: bool = False) -> bool:
@@ -463,15 +463,13 @@ class _ShellPresenter(_BasePresenter):
         *,
         expanded: bool = False,
     ) -> ToolResultPresentation:
-        if not result.success:
-            return super().present_result(result, expanded=expanded)
         try:
             parsed = json.loads(result.output)
         except (json.JSONDecodeError, TypeError):
             parsed = None
         if not isinstance(parsed, dict):
             return ToolResultPresentation(
-                summary="Completed",
+                summary="Completed" if result.success else "Failed",
                 preview=self._preview(result.output, expanded=expanded),
                 truncated=self._is_truncated(
                     result.output,
@@ -481,7 +479,8 @@ class _ShellPresenter(_BasePresenter):
         exit_code = parsed.get("exit_code")
         stdout = str(parsed.get("stdout", "")).strip()
         stderr = str(parsed.get("stderr", "")).strip()
-        details = "\n".join(part for part in (stdout, stderr) if part)
+        streams = (stderr, stdout) if exit_code != 0 else (stdout, stderr)
+        details = "\n".join(part for part in streams if part)
         return ToolResultPresentation(
             summary=f"Exited with code {exit_code}",
             metrics={"exit_code": exit_code},
@@ -519,8 +518,8 @@ class ToolPresenterRegistry:
     def __init__(
         self,
         *,
-        output_limit: int = 1200,
-        output_lines: int = 10,
+        output_limit: int = 600,
+        output_lines: int = 3,
     ) -> None:
         options = {
             "output_limit": output_limit,

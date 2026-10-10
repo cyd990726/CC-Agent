@@ -530,13 +530,6 @@ class TerminalApp:
                 if self._closing:
                     cancellation.cancel()
             try:
-                if self._ui_active:
-                    self._print_message(
-                        Text.assemble(
-                            ("› ", "bold bright_cyan"),
-                            (task, "default"),
-                        )
-                    )
                 self.run_task(
                     task,
                     cancellation=cancellation,
@@ -2473,37 +2466,20 @@ class TerminalApp:
 
     def _activity_fragments(self) -> FormattedText:
         width = get_app().output.get_size().columns
-        if self._selection_control is not None and self._selection_control.snapshot is not None:
-            message = self._copy_notice or "拖动选择文本"
-            return self._activity_line_fragments(
-                f"  {message} · Ctrl+C 复制 · Esc 清除选区",
-                "class:session-status",
-                width,
-            )
         with self._state_lock:
             message = self._activity_message
             started_at = self._activity_started_at
-            browsing = (
-                not self._terminal_view_state.follow_tail
-                or self._transcript_cursor_line is not None
-                or (
-                    self._transcript_window is not None
-                    and self._transcript_window._view_anchor is not None
-                )
-            )
-            if not browsing and not self._terminal_view_state.follow_tail:
-                self._terminal_view_state = reduce_terminal(
-                    self._terminal_view_state,
-                    FollowTail(),
-                )
-                self._unseen_block_ids.clear()
-            unseen = self._terminal_view_state.unseen_count
-        if browsing:
-            unseen_label = f" · {unseen} 条新内容" if unseen else ""
-            return FormattedText([("class:session-status", self._truncate_cells(
-                f"  正在查看历史{unseen_label} · Ctrl+End 返回最新内容",
+        if (
+            message is None
+            and self._selection_control is not None
+            and self._selection_control.snapshot is not None
+        ):
+            notice = self._copy_notice or "拖动选择文本"
+            return self._activity_line_fragments(
+                f"  {notice} · Ctrl+C 复制 · Esc 清除选区",
+                "class:session-status",
                 width,
-            ))])
+            )
         queued = len(self.renderer.presentation_store.state.queued_turn_ids)
         if message is None and queued:
             return FormattedText(
