@@ -162,8 +162,13 @@ mini-agent --no-confirm
 ```
 
 交互界面支持 `/plan`、`/permissions`、`/clear`、`/status`、`/history`、`/verbose` 和
-`/exit`。输入 `/` 会打开命令面板，可用 `Tab` 选择；`Shift+Tab` 可在
+`/exit`。也支持 `/new` 开始新会话、`/resume` 列出历史会话并用方向键选择、
+`/resume <session-id>` 直接恢复指定会话并回放该会话历史、
+`/session` 查看当前会话、`/sessions`
+列出最近会话、`/memories` 查看项目记忆、`/remember ...` 保存一条项目记忆。
+输入 `/` 会打开命令面板，可用 `Tab` 选择；`Shift+Tab` 可在
 Ask for approval、Accept edits、Full Access 和 Plan mode 之间快速切换。
+`Ctrl+O` 可展开或折叠最近的工具结果，`Ctrl+End` 返回最新输出。
 输入框下方右侧会显示当前模式；Ask for approval 状态下不显示模式标签。
 长输入会自动折行并增高输入框，`Alt+Enter` 或 `Ctrl+J` 可以主动换行。`/plan` 可在
 会话中切换只读计划模式并在关闭时恢复原权限；Plan mode 下通过 `/permissions`
@@ -175,10 +180,28 @@ Ask for approval、Accept edits、Full Access 和 Plan mode 之间快速切换�
 选择期间输出视图固定，清除选区后恢复更新；调整窗口宽度会清除旧选区。
 本地剪贴板不可用时会请求终端复制，是否成功取决于终端的 OSC 52 支持。
 
+Mini Agent 会把会话和项目记忆保存到用户数据目录，默认是
+`~/.local/share/mini-agent/projects/<project>/`，也可以用 `MINI_AGENT_HOME`
+指定根目录。交互模式默认准备一个新会话，但不会保存未执行过任务的空会话；使用
+`--resume` / `--resume <session-id>` 启动时恢复已有会话，也可以在交互界面用
+`/resume` 选择历史会话。
+第一条任务提交后会话才正式落盘，单次任务也会保存为持久会话。每个会话存放在
+`sessions/<session-id>/`：`meta.json` 保存标题和更新时间等轻量信息，
+`events.jsonl` 追加记录任务、模型响应、工具结果和终止状态，`snapshot.json`
+作为长会话恢复加速缓存。项目记忆存放在该目录的 `memory/MEMORY.md`，
+会注入后续任务的系统提示；Mini Agent 会主动保存适合跨会话保留的用户偏好、
+更正、决策和项目背景，不会为写入自己的记忆文件额外弹权限确认。
+会话记录会在任务提交时立即保存标题和任务项，并在工具调用完成、最终回答、
+失败或取消事件发生时继续 checkpoint 当前 turn；中途退出后用 `/resume`
+至少能看到任务执行到的状态和已完成工具，继续提问时也能读取已 checkpoint 的
+`messages` 上下文。
+
 授权确认展示完整命令或代码差异，支持方向键和 Enter，也可用 `1/2/3` 选择
 允许一次、会话内允许该工具、拒绝；默认选中拒绝。会话授权适用于该工具后续的
-所有调用，并非只授权当前命令或文件。编辑完成后默认展示完整 diff；
-`/verbose` 控制其他工具后续输出的详细程度，不会展开已输出的历史记录。
+所有调用，并非只授权当前命令或文件。工具结果默认显示摘要，正文最多预览 3 行、
+600 字符；编辑结果默认折叠 diff，失败的 shell 结果优先预览 stderr。
+`Ctrl+O` 展开或折叠单个结果，`/verbose` 切换全部工具结果（包括已有历史）的
+展开状态。模型协议重试会直接显示错误原因，无需开启 verbose。
 
 ## 内置工具
 
@@ -188,6 +211,8 @@ Ask for approval、Accept edits、Full Access 和 Plan mode 之间快速切换�
 | `edit_file` / `write_file` | 精确编辑或写入文件 | 是 |
 | `find_files` / `list_files` | 查找与列出文件 | 否 |
 | `search` | 搜索工作区文本 | 否 |
+| `read_memory` | 读取项目记忆 | 否 |
+| `remember` | 保存项目记忆 | 否 |
 | `shell` | 在工作目录启动 Shell 命令 | 是 |
 | `web_search` | Tavily、Brave Search 或 Serper 搜索 | 是 |
 | `fetch_url` | 抓取公开网页文本 | 是 |

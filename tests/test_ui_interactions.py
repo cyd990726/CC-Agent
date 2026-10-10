@@ -13,17 +13,187 @@ from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.text import Text
 from agent.cancellation import CancellationToken
 
 from agent.permissions import PermissionMode
 from agent.events import AgentEvent, EventType
 from agent.runtime import AgentRuntime
 from ui.permissions import SessionPermissionHandler
-from ui.renderer import TerminalRenderer, _JsonStringFieldStreamer
+from ui.presentation import JsonStringFieldStreamer
+from ui.renderer import TerminalRenderer
 from ui.terminal import TerminalApp, _TranscriptWindow
+from ui.transcript import TranscriptBlock
+from ui.view_model import ScrollAway, reduce_terminal
 
 
 class InteractionTests(unittest.TestCase):
+    def test_transcript_block_caches_compact_and_expanded_projection(self):
+        block = TranscriptBlock(
+            (Text("compact"),),
+            block_id="tool:1",
+            expanded_objects=(Text("expanded"),),
+        )
+
+        self.assertEqual(block.render(80, None), "compact\n")
+        self.assertEqual(block.render(80, None, expanded=True), "expanded\n")
+        self.assertTrue(block.expandable)
+
+    def test_transcript_upsert_replaces_a_stable_block(self):
+        app = self.make_app()
+        app._ui_active = True
+
+        app._upsert_renderables("tool:1", (Text("first"),))
+        app._upsert_renderables("tool:1", (Text("second"),))
+
+        self.assertEqual(len(app._transcript_blocks), 1)
+        rendered = fragment_list_to_text(app._transcript_styled)
+        self.assertNotIn("first", rendered)
+        self.assertIn("second", rendered)
+
+    def test_ctrl_o_toggles_the_latest_expandable_block(self):
+        app = self.make_app()
+        app._ui_active = True
+        app._upsert_renderables(
+            "tool:1",
+            (Text("compact"),),
+            (Text("expanded"),),
+        )
+
+        self.assertTrue(app._toggle_focused_block())
+        self.assertIn("expanded", fragment_list_to_text(app._transcript_styled))
+        self.assertTrue(app._toggle_focused_block())
+        rendered = fragment_list_to_text(app._transcript_styled)
+        self.assertIn("compact", rendered)
+        self.assertNotIn("expanded", rendered)
+
+    def test_browsing_reports_unseen_content(self):
+        app = self.make_app()
+        app._ui_active = True
+        app._terminal_view_state = reduce_terminal(
+            app._terminal_view_state,
+            ScrollAway(None),
+        )
+
+        app._append_renderables((Text("first"),))
+        app._append_renderables((Text("second"),))
+
+        fake_app = Mock()
+        fake_app.output.get_size.return_value.columns = 80
+        with patch("ui.terminal.get_app", return_value=fake_app):
+            activity = fragment_list_to_text(app._activity_fragments())
+        self.assertEqual(app._terminal_view_state.unseen_count, 2)
+        self.assertEqual(activity, "")
+
+    def test_transcript_budget_keeps_recent_blocks_and_notice(self):
+        app = self.make_app()
+        app._ui_active = True
+        app.MAX_TRANSCRIPT_BLOCKS = 5
+        app.TRIM_TRANSCRIPT_BLOCKS = 1
+
+        for index in range(8):
+            app._append_renderables((Text(f"block-{index}"),))
+
+        self.assertLessEqual(len(app._transcript_blocks), 5)
+        rendered = fragment_list_to_text(app._transcript_styled)
+        self.assertIn("older transcript blocks omitted", rendered)
+        self.assertIn("block-7", rendered)
+        self.assertNotIn("block-0", rendered)
+
+    def test_streaming_answer_updates_one_stable_transcript_block(self):
+        app = self.make_app()
+        app._ui_active = True
+        app.renderer.set_activity_handler(app._update_activity)
+        app.renderer.set_render_handler(app._append_renderables)
+        app.renderer.set_block_handler(app._upsert_renderables)
+
+        app.renderer(AgentEvent(EventType.RUN_STARTED, {"task": "answer"}))
+        app.renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        app.renderer(
+            AgentEvent(
+                EventType.MODEL_DELTA,
+                {"delta": '{"final_answer":"first'},
+            )
+        )
+        app.renderer(
+            AgentEvent(
+                EventType.MODEL_DELTA,
+                {"delta": ' second"}'},
+            )
+        )
+        app.renderer(
+            AgentEvent(
+                EventType.RUN_COMPLETED,
+                {"answer": "first second", "steps": 1},
+            )
+        )
+
+        answer_blocks = [
+            block
+            for block in app._transcript_blocks
+            if block.block_id is not None
+            and block.block_id.startswith("answer:")
+        ]
+        self.assertEqual(len(answer_blocks), 1)
+        rendered = fragment_list_to_text(app._transcript_styled)
+        self.assertEqual(rendered.count("first second"), 1)
+
+    def test_verbose_reflows_an_existing_tool_result(self):
+        app = self.make_app()
+        app._ui_active = True
+        app.renderer.set_activity_handler(app._update_activity)
+        app.renderer.set_render_handler(app._append_renderables)
+        app.renderer.set_block_handler(app._upsert_renderables)
+        app.renderer(AgentEvent(EventType.RUN_STARTED, {"task": "edit"}))
+        app.renderer(
+            AgentEvent(
+                EventType.TOOL_REQUESTED,
+                {
+                    "tool": "edit_file",
+                    "args": {
+                        "path": "a.py",
+                        "old_text": "old",
+                        "new_text": "new",
+                    },
+                },
+            )
+        )
+        app.renderer(
+            AgentEvent(
+                EventType.TOOL_STARTED,
+                {"tool": "edit_file"},
+            )
+        )
+        app.renderer(
+            AgentEvent(
+                EventType.TOOL_COMPLETED,
+                {
+                    "result": {
+                        "tool": "edit_file",
+                        "args": {"path": "a.py"},
+                        "success": True,
+                        "output": (
+                            "updated a.py\n--- a/a.py\n+++ b/a.py\n"
+                            "@@ -1 +1 @@\n-old\n+new"
+                        ),
+                    }
+                },
+            )
+        )
+
+        compact = fragment_list_to_text(app._transcript_styled)
+        self.assertIn("Updated a.py · +1 / -1 lines", compact)
+        self.assertNotIn("    │ -old", compact)
+
+        app._handle_command("/verbose")
+        expanded = fragment_list_to_text(app._transcript_styled)
+        self.assertIn("    │ -old", expanded)
+        self.assertIn("    │ +new", expanded)
+
+        app._handle_command("/verbose")
+        collapsed = fragment_list_to_text(app._transcript_styled)
+        self.assertNotIn("    │ -old", collapsed)
+
     def test_copy_selection_precedes_cancel_and_escape_restores_cancel(self):
         from prompt_toolkit.keys import Keys
 
@@ -80,6 +250,29 @@ class InteractionTests(unittest.TestCase):
         self.assertTrue(token.event.is_set())
         self.assertEqual(app._input_field.text, "draft")
 
+    def test_escape_cancels_busy_task_and_preserves_input_draft(self):
+        from prompt_toolkit.keys import Keys
+
+        app = self.make_app()
+        token = CancellationToken()
+        app._active_cancellation = token
+        with create_pipe_input() as pipe:
+            application = app._create_application(input=pipe, output=DummyOutput())
+        app._input_field.text = "draft"
+        event = Mock(app=application)
+
+        bindings = [
+            binding
+            for binding in application.key_bindings.get_bindings_for_keys(
+                (Keys.Escape,)
+            )
+            if binding.filter()
+        ]
+        bindings[-1].handler(event)
+
+        self.assertTrue(token.event.is_set())
+        self.assertEqual(app._input_field.text, "draft")
+
     def make_app(self, width=80):
         console = Console(file=StringIO(), width=width, force_terminal=False)
         runtime = Mock(spec=AgentRuntime)
@@ -119,6 +312,32 @@ class InteractionTests(unittest.TestCase):
                 self.assertLessEqual(get_cwidth(text), width)
                 if width >= len("full access on"):
                     self.assertIn("full access on", text)
+
+    def test_enter_submission_renders_task_once_and_executes_once(self):
+        from agent.state import AgentState
+        from prompt_toolkit.widgets import TextArea
+
+        app = self.make_app()
+        app._ui_active = True
+        app.renderer.set_block_handler(app._upsert_renderables)
+        task = "总结一下当前分支的改动"
+        input_field = TextArea(text=task)
+
+        def run(task, **kwargs):
+            kwargs["on_event"](AgentEvent(EventType.RUN_STARTED, {"task": task}))
+            return AgentState(current_task=task)
+
+        app.runtime.run.side_effect = run
+        app._submit_input(input_field, Mock())
+        app._task_queue.put(None)
+        app._task_worker()
+
+        app.runtime.run.assert_called_once()
+        self.assertEqual(app.runtime.run.call_args.args[0], task)
+        self.assertEqual(input_field.text, "")
+        rendered = fragment_list_to_text(app._transcript_styled)
+        self.assertEqual(rendered.count(task), 1)
+        self.assertEqual(app.history, [task])
 
     def test_unexpected_task_error_does_not_kill_queue_worker(self):
         app = self.make_app()
@@ -211,20 +430,21 @@ class InteractionTests(unittest.TestCase):
         answer = "中文 😀 done\n\n"
         payload = json.dumps({"final_answer": answer}, ensure_ascii=True)
         for split in range(len(payload) + 1):
-            stream = _JsonStringFieldStreamer("final_answer")
+            stream = JsonStringFieldStreamer("final_answer")
             result = stream.feed(payload[:split]) + stream.feed(payload[split:])
             self.assertEqual(result, answer)
-        stream = _JsonStringFieldStreamer("final_answer")
+        stream = JsonStringFieldStreamer("final_answer")
         self.assertEqual("".join(stream.feed(char) for char in payload), answer)
 
-    def test_invalid_unicode_escape_does_not_crash_renderer(self):
-        stream = _JsonStringFieldStreamer("final_answer")
+    def test_invalid_unicode_escape_does_not_crash_streamer(self):
+        stream = JsonStringFieldStreamer("final_answer")
         self.assertEqual(stream.feed('{"final_answer":"\\uZZZZ"}'), "�")
 
     def test_answer_activity_persists_without_resetting_for_each_delta(self):
         app = self.make_app()
         updates = []
         app.renderer.set_activity_handler(lambda message, start: updates.append((message, start)))
+        app.renderer(AgentEvent(EventType.RUN_STARTED, {"task": "test"}))
         app.renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
         app.renderer(AgentEvent(EventType.MODEL_DELTA, {"delta": '{"final_answer":"hello'}))
         responding = updates[-1]

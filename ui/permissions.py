@@ -59,7 +59,13 @@ class SessionPermissionHandler:
         console: Console,
         *,
         protected_tools: frozenset[str] = frozenset(
-            {"edit_file", "write_file", "shell", "web_search", "fetch_url"}
+            {
+                "edit_file",
+                "write_file",
+                "shell",
+                "web_search",
+                "fetch_url",
+            }
         ),
         workspace: Path | None = None,
         mode: PermissionMode = PermissionMode.ASK,

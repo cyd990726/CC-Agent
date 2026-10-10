@@ -1,7 +1,5 @@
 """Render agent events as a polished, compact terminal transcript."""
 
-import json
-import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -15,6 +13,20 @@ from rich.table import Table
 from rich.text import Text
 
 from agent.events import AgentEvent, EventType
+from tools.base import ToolResult
+from ui.presentation import (
+    PresentationAdapter,
+    PresentationStore,
+    ToolPresenterRegistry,
+)
+from ui.view_model import (
+    AssistantCommentary,
+    AssistantTextDelta,
+    RunCompleted as PresentationRunCompleted,
+    RunStarted as PresentationRunStarted,
+    ToolCompleted as PresentationToolCompleted,
+    ToolRequested as PresentationToolRequested,
+)
 
 
 ACCENT = "bright_cyan"
@@ -70,6 +82,7 @@ class _ToolProgress:
 
 @dataclass
 class _ExplorationEntry:
+    call_id: str | None
     tool: str
     title: str
     details: list[str]
@@ -94,96 +107,6 @@ class _ExplorationGroup:
         return self.renderer._exploration_renderable(self)
 
 
-class _JsonStringFieldStreamer:
-    """Extract and incrementally decode one JSON string field."""
-
-    def __init__(self, field: str) -> None:
-        self._pattern = re.compile(rf'"{re.escape(field)}"\s*:\s*"')
-        self._buffer = ""
-        self._started = False
-        self._escaped = False
-        self._unicode_digits: str | None = None
-        self._high_surrogate: int | None = None
-        self.finished = False
-
-    def feed(self, chunk: str) -> str:
-        if self.finished:
-            return ""
-        if not self._started:
-            self._buffer += chunk
-            match = self._pattern.search(self._buffer)
-            if match is None:
-                return ""
-            chunk = self._buffer[match.end() :]
-            self._buffer = ""
-            self._started = True
-
-        output: list[str] = []
-        for character in chunk:
-            if self._unicode_digits is not None:
-                self._unicode_digits += character
-                if len(self._unicode_digits) == 4:
-                    try:
-                        codepoint = int(self._unicode_digits, 16)
-                    except ValueError:
-                        codepoint = 0xFFFD
-                    if self._high_surrogate is not None:
-                        if 0xDC00 <= codepoint <= 0xDFFF:
-                            combined = (
-                                0x10000
-                                + ((self._high_surrogate - 0xD800) << 10)
-                                + codepoint - 0xDC00
-                            )
-                            output.append(chr(combined))
-                            self._high_surrogate = None
-                            self._unicode_digits = None
-                            self._escaped = False
-                            continue
-                        output.append("�")
-                        self._high_surrogate = None
-                    if 0xD800 <= codepoint <= 0xDBFF:
-                        self._high_surrogate = codepoint
-                    else:
-                        output.append(
-                            chr(codepoint) if not 0xDC00 <= codepoint <= 0xDFFF else "�"
-                        )
-                    self._unicode_digits = None
-                    self._escaped = False
-                continue
-            if self._escaped:
-                if character == "u":
-                    self._unicode_digits = ""
-                    continue
-                output.append(
-                    {
-                        '"': '"',
-                        "\\": "\\",
-                        "/": "/",
-                        "b": "\b",
-                        "f": "\f",
-                        "n": "\n",
-                        "r": "\r",
-                        "t": "\t",
-                    }.get(character, character)
-                )
-                self._escaped = False
-                continue
-            if character == "\\":
-                self._escaped = True
-            elif character == '"':
-                if self._high_surrogate is not None:
-                    output.append("�")
-                    self._high_surrogate = None
-                self.finished = True
-                break
-            else:
-                if self._high_surrogate is not None:
-                    output.append("�")
-                    self._high_surrogate = None
-                output.append(character)
-        return "".join(output)
-
-
 class TerminalRenderer:
     """Translate runtime events into a readable terminal conversation."""
 
@@ -203,23 +126,34 @@ class TerminalRenderer:
         console: Console,
         *,
         verbose: bool = False,
-        output_limit: int = 1200,
-        output_lines: int = 10,
+        output_limit: int = 600,
+        output_lines: int = 3,
         live_factory: type[Live] = Live,
+        presentation_store: PresentationStore | None = None,
     ) -> None:
         self.console = console
         self.verbose = verbose
         self.output_limit = output_limit
         self.output_lines = output_lines
         self.live_factory = live_factory
+        if presentation_store is None:
+            presenters = ToolPresenterRegistry(
+                output_limit=output_limit,
+                output_lines=output_lines,
+            )
+            presentation_store = PresentationStore(
+                adapter=PresentationAdapter(presenters=presenters)
+            )
+        self.presentation_store = presentation_store
+        self.tool_presenters = self.presentation_store.adapter.presenters
         self._status: Status | None = None
         self._live_tool: Live | None = None
         self._tool_request: Mapping[str, Any] | None = None
         self._tool_request_printed = False
         self._exploration: _ExplorationGroup | None = None
         self._live_exploration: Live | None = None
-        self._answer_stream = _JsonStringFieldStreamer("final_answer")
         self._answer_text = ""
+        self._answer_block_id: str | None = None
         self._visible_answer_text = ""
         self._streamed_answer = False
         self._has_answer_stream = False
@@ -229,10 +163,20 @@ class TerminalRenderer:
         self._activity_handler: Callable[[str | None, float | None], None] | None = None
         self._output_handler: Callable[[str], None] | None = None
         self._render_handler = None
+        self._stream_render_handler = None
+        self._block_handler = None
 
     def set_render_handler(self, handler) -> None:
         """Preserve source renderables for width-dependent transcript layout."""
         self._render_handler = handler
+
+    def set_stream_render_handler(self, handler) -> None:
+        """Replace one cumulative Markdown preview instead of appending snapshots."""
+        self._stream_render_handler = handler
+    def set_block_handler(self, handler) -> None:
+        """Upsert one stable transcript block with compact/expanded views."""
+
+        self._block_handler = handler
 
     def set_activity_handler(
         self,
@@ -268,11 +212,41 @@ class TerminalRenderer:
             self._output_handler(rendered)
 
     def __call__(self, event: AgentEvent) -> None:
+        # Build the new semantic presentation state in parallel with the legacy
+        # renderer. Rendering switches to this state in the next migration slice.
+        self.presentation_store.handle(event)
+        presentation_events = self.presentation_store.last_events
+        for presentation_event in presentation_events:
+            if isinstance(presentation_event, AssistantTextDelta):
+                self._answer_block_id = presentation_event.block_id
+                self._render_answer_text_delta(
+                    presentation_event.text,
+                    block_id=presentation_event.block_id,
+                )
         if event.type is EventType.RUN_STARTED:
             self._run_started_at = time.monotonic()
+            started = next(
+                (
+                    item
+                    for item in presentation_events
+                    if isinstance(item, PresentationRunStarted)
+                ),
+                None,
+            )
+            if self._block_handler is not None and started is not None:
+                self._block_handler(
+                    f"prompt:{started.context.turn_id}",
+                    (
+                        Text.assemble(
+                            ("› ", f"bold {ACCENT}"),
+                            (started.prompt, "default"),
+                        ),
+                    ),
+                    None,
+                    {},
+                )
             return
         if event.type is EventType.MODEL_STARTED:
-            self._answer_stream = _JsonStringFieldStreamer("final_answer")
             self._answer_text = ""
             self._visible_answer_text = ""
             self._streamed_answer = False
@@ -282,27 +256,28 @@ class TerminalRenderer:
             self._start_status(f"Thinking · step {step}")
             return
         if event.type is EventType.MODEL_DELTA:
-            self._render_answer_delta(str(event.data.get("delta", "")))
             return
         if event.type is EventType.MODEL_COMPLETED:
             self._stop_status()
-            response = event.data.get("response", {})
-            if isinstance(response, Mapping) and "final_answer" in response:
-                self._finish_exploration()
-            if isinstance(response, Mapping) and not self._has_answer_stream:
-                thought = response.get("thought")
-                if isinstance(thought, str) and thought.strip():
-                    self._finish_exploration()
-                    commentary = Table.grid(padding=0, expand=True)
-                    commentary.add_column(width=2, no_wrap=True)
-                    commentary.add_column(ratio=1)
-                    commentary.add_row(Text("• ", style=MUTED), Markdown(thought.strip()))
-                    self._print(Group(Text(""), commentary, Text("")))
+            for presentation_event in presentation_events:
+                if isinstance(presentation_event, AssistantCommentary):
+                    self._render_commentary(
+                        presentation_event.text,
+                        block_id=presentation_event.block_id,
+                    )
             return
         if event.type is EventType.TOOL_REQUESTED:
             tool = str(event.data.get("tool", "unknown"))
+            requested = next(
+                (
+                    item
+                    for item in presentation_events
+                    if isinstance(item, PresentationToolRequested)
+                ),
+                None,
+            )
             if tool in self.EXPLORATION_TOOLS and self.console.is_terminal:
-                self._start_exploration_tool(event.data)
+                self._start_exploration_tool(event.data, requested=requested)
             else:
                 self._finish_exploration()
                 self._start_tool(event.data)
@@ -312,42 +287,99 @@ class TerminalRenderer:
                 self._tool_started_at = time.monotonic()
             return
         if event.type is EventType.TOOL_COMPLETED:
-            if not self._complete_exploration_tool(event.data):
+            completed = next(
+                (
+                    item
+                    for item in presentation_events
+                    if isinstance(item, PresentationToolCompleted)
+                ),
+                None,
+            )
+            if not self._complete_exploration_tool(
+                event.data,
+                completed=completed,
+            ):
                 self._finish_tool()
-                self._render_tool_result(event.data)
+                self._render_tool_result(event.data, completed=completed)
             self._tool_started_at = None
             return
         if event.type is EventType.RUN_COMPLETED:
-            self._render_completion(event.data)
+            self._finish_exploration()
+            completion = next(
+                (
+                    item
+                    for item in presentation_events
+                    if isinstance(item, PresentationRunCompleted)
+                ),
+                None,
+            )
+            if completion is None:
+                self._render_completion(
+                    str(event.data.get("answer", "")),
+                    int(event.data.get("steps", 0)),
+                )
+            else:
+                self._render_completion(
+                    completion.answer,
+                    completion.steps,
+                    duration_ms=completion.duration_ms,
+                    block_id=completion.answer_block_id,
+                )
             self._answer_text = ""
             self._visible_answer_text = ""
+            self._answer_block_id = None
             return
         if event.type is EventType.RUN_FAILED:
+            self._finish_streaming_preview()
             self.close()
             error = str(event.data.get("error", "运行失败"))
             self._print(Text.assemble(("✕ ", "bold red"), (error, "red")))
         if event.type is EventType.RUN_CANCELLED:
             self.close()
             remaining = self._answer_text[len(self._visible_answer_text):]
-            if remaining.strip():
+            if self._block_handler is not None and self._answer_block_id is not None:
+                self._upsert_answer_block(
+                    self._answer_block_id,
+                    self._answer_text,
+                )
+            elif remaining.strip():
                 if not self._streamed_answer:
                     self._print(Text("✦ Mini Agent", style=f"bold {ACCENT}"))
                 self._print(Markdown(remaining))
             self._print(Text("  ■ 当前任务已取消", style="yellow"))
             self._answer_text = ""
             self._visible_answer_text = ""
+            self._answer_block_id = None
 
     def toggle_verbose(self) -> bool:
         self.verbose = not self.verbose
         return self.verbose
+
+    def answer_renderables(
+        self,
+        answer: str,
+        *,
+        leading_blank: bool = True,
+    ) -> tuple[Any, ...]:
+        """Build the shared Markdown view used by live and resumed answers."""
+
+        renderables: list[Any] = []
+        if leading_blank:
+            renderables.append(Text(""))
+        renderables.extend(
+            [
+                Text("✦ Mini Agent", style=f"bold {ACCENT}"),
+                Markdown(answer),
+            ]
+        )
+        return tuple(renderables)
 
     def close(self) -> None:
         self._stop_status()
         self._finish_tool()
         self._finish_exploration()
 
-    def _render_answer_delta(self, delta: str) -> None:
-        text = self._answer_stream.feed(delta)
+    def _render_answer_text_delta(self, text: str, *, block_id: str) -> None:
         if not text:
             return
         self._answer_text += text
@@ -356,13 +388,36 @@ class TerminalRenderer:
             self._stop_status()
             self._finish_exploration()
             self._start_status("Responding")
+        if self._block_handler is not None:
+            self._upsert_answer_block(block_id, self._answer_text)
+            return
         self._write_stable_answer()
 
-    def _render_completion(self, data: Mapping[str, Any]) -> None:
+    def _render_commentary(self, text: str, *, block_id: str) -> None:
+        self._finish_exploration()
+        commentary = Table.grid(padding=0, expand=True)
+        commentary.add_column(width=2, no_wrap=True)
+        commentary.add_column(ratio=1)
+        commentary.add_row(Text("• ", style=MUTED), Markdown(text))
+        renderable = Group(Text(""), commentary, Text(""))
+        if self._block_handler is not None:
+            self._block_handler(block_id, (renderable,), None, {})
+        else:
+            self._print(renderable)
+
+    def _render_completion(
+        self,
+        answer: str,
+        steps: int,
+        *,
+        duration_ms: int | None = None,
+        block_id: str | None = None,
+    ) -> None:
         self._stop_status()
-        answer = str(data.get("answer", ""))
         renderables: list[Any] = []
-        if self._streamed_answer:
+        if self._stream_render_handler is not None and self._has_answer_stream:
+            self._publish_streaming_preview(answer, final=True)
+        elif self._streamed_answer:
             committed = len(self._visible_answer_text)
             # Runtime trims the final answer. Streaming offsets refer to the
             # untrimmed JSON string, so leading whitespace must be accounted for.
@@ -376,19 +431,40 @@ class TerminalRenderer:
                 renderables.append(Markdown(remaining))
                 self._answer_blocks_written += 1
         else:
-            renderables.extend(
-                [
-                    Text(""),
-                    Text("✦ Mini Agent", style=f"bold {ACCENT}"),
-                    Markdown(answer),
-                ]
-            )
+            renderables.extend(self.answer_renderables(answer))
 
-        elapsed = self._elapsed(self._run_started_at)
-        steps = data.get("steps", 0)
+        elapsed = (
+            self._format_duration(duration_ms)
+            if duration_ms is not None
+            else self._elapsed(self._run_started_at)
+        )
         meta = f"Done in {elapsed} · {steps} step{'s' if steps != 1 else ''}"
+        if self._block_handler is not None and block_id is not None:
+            self._upsert_answer_block(block_id, answer, meta=meta)
+            return
         renderables.append(Text(f"  ✓ {meta}", style=MUTED))
         self._print(Group(*renderables))
+
+    def _upsert_answer_block(
+        self,
+        block_id: str,
+        answer: str,
+        *,
+        meta: str | None = None,
+    ) -> None:
+        renderables: list[Any] = [
+            Text(""),
+            Text("✦ Mini Agent", style=f"bold {ACCENT}"),
+            Markdown(answer),
+        ]
+        if meta is not None:
+            renderables.append(Text(f"  ✓ {meta}", style=MUTED))
+        self._block_handler(
+            block_id,
+            (Group(*renderables),),
+            None,
+            {},
+        )
 
     def _start_status(self, message: str) -> None:
         self._stop_status()
@@ -420,23 +496,26 @@ class TerminalRenderer:
         self._visible_answer_text = visible_text
         if not new_text:
             return
-        renderables: list[Any] = []
-        if not self._streamed_answer:
-            renderables.extend(
-                [
-                    Text(""),
-                    Text("✦ Mini Agent", style=f"bold {ACCENT}"),
-                ]
-            )
-            self._streamed_answer = True
-        elif self._answer_blocks_written:
-            renderables.append(Text(""))
-        # Commit each complete line exactly once. Re-rendering the accumulated
-        # answer in a Live region leaks old frames into scrollback when a long
-        # response exceeds the terminal height.
-        renderables.append(Markdown(new_text))
-        self._print(Group(*renderables))
-        self._answer_blocks_written += 1
+        if self._stream_render_handler is not None:
+            self._publish_streaming_preview(visible_text, final=False)
+            return
+        # A permanent terminal transcript cannot safely append independently
+        # parsed Markdown suffixes: lists, quotes, tables, and indented code
+        # may continue across a blank line. Non-interactive output therefore
+        # waits for RUN_COMPLETED and renders the complete document once.
+        return
+
+    def _publish_streaming_preview(self, text: str, *, final: bool) -> None:
+        if self._stream_render_handler is None:
+            return
+        renderables = list(self.answer_renderables(text))
+        self._stream_render_handler(tuple(renderables), {}, final)
+        self._streamed_answer = True
+        self._answer_blocks_written = 1
+
+    def _finish_streaming_preview(self) -> None:
+        if self._stream_render_handler is not None and self._answer_text.strip():
+            self._publish_streaming_preview(self._answer_text, final=True)
 
     @staticmethod
     def _stable_streaming_text(text: str) -> str:
@@ -490,7 +569,12 @@ class TerminalRenderer:
         self._tool_request = None
         self._tool_request_printed = False
 
-    def _start_exploration_tool(self, data: Mapping[str, Any]) -> None:
+    def _start_exploration_tool(
+        self,
+        data: Mapping[str, Any],
+        *,
+        requested: PresentationToolRequested | None = None,
+    ) -> None:
         self._finish_tool()
         now = time.monotonic()
         if self._exploration is None:
@@ -509,20 +593,33 @@ class TerminalRenderer:
         args = args if isinstance(args, Mapping) else {}
         title, details = self._tool_description(tool, args)
         self._exploration.entries.append(
-            _ExplorationEntry(tool, title, details, now)
+            _ExplorationEntry(
+                requested.call_id if requested is not None else None,
+                tool,
+                title,
+                details,
+                now,
+            )
         )
         self._tool_started_at = now
         if self._activity_handler is not None:
             self._activity_handler(self._tool_activity(data), now)
         self._refresh_exploration()
 
-    def _complete_exploration_tool(self, data: Mapping[str, Any]) -> bool:
+    def _complete_exploration_tool(
+        self,
+        data: Mapping[str, Any],
+        *,
+        completed: PresentationToolCompleted | None = None,
+    ) -> bool:
         if self._exploration is None or self._exploration.active is None:
             return False
         result = data.get("result", {})
         if not isinstance(result, Mapping):
             return False
         entry = self._exploration.active
+        if completed is not None and entry.call_id not in {None, completed.call_id}:
+            return False
         if str(result.get("tool", "")) != entry.tool:
             return False
         entry.success = bool(result.get("success"))
@@ -573,13 +670,29 @@ class TerminalRenderer:
             if entry.success is False and entry.output:
                 error = self._one_line(entry.output.splitlines()[0], 80)
                 line.append(f" — {error}", style="red")
-            self._print(line)
-            if self.verbose and entry.success is True and entry.output:
-                _summary, details = self._tool_result_summary(
-                    entry.tool, entry.output, True
+            result = self.tool_presenters.result(
+                ToolResult(entry.tool, {}, bool(entry.success), entry.output),
+                expanded=True,
+            )
+            detail_lines = tuple(
+                Text(
+                    f"      │ {detail}",
+                    style=MUTED if entry.success else "red",
                 )
-                for detail in details:
-                    self._print(Text(f"      │ {detail}", style=MUTED))
+                for detail in result.preview
+            )
+            if self._block_handler is not None and entry.call_id is not None:
+                self._block_handler(
+                    f"tool-result:{entry.call_id}",
+                    (line,),
+                    (line, *detail_lines) if detail_lines else None,
+                    {},
+                )
+            else:
+                self._print(line)
+                if self.verbose:
+                    for detail in detail_lines:
+                        self._print(detail)
             group.committed_entries += 1
 
     def _tool_activity(self, data: Mapping[str, Any]) -> str:
@@ -678,47 +791,17 @@ class TerminalRenderer:
     def _tool_description(
         self, tool: str, args: Mapping[str, Any]
     ) -> tuple[str, list[str]]:
-        if tool in {"read_file", "edit_file", "write_file"}:
-            path = str(args.get("path", ""))
-            details: list[str] = []
-            content = args.get("content")
-            if tool == "write_file" and isinstance(content, str):
-                details.append(f"{len(content):,} characters")
-            if tool == "read_file" and ("offset" in args or "limit" in args):
-                offset = args.get("offset", 1)
-                limit = args.get("limit")
-                if isinstance(limit, int):
-                    details.append(f"lines {offset}-{offset + limit - 1}")
-                else:
-                    details.append(f"from line {offset}")
-            if tool == "edit_file":
-                old_text = str(args.get("old_text", ""))
-                new_text = str(args.get("new_text", ""))
-                details.append(f"{len(old_text):,} → {len(new_text):,} characters")
-            return path, details
-        if tool == "find_files":
-            pattern = str(args.get("pattern", ""))
-            return pattern, [f"in {args.get('path', '.')}"]
-        if tool == "list_files":
-            path = str(args.get("path", "."))
-            return path, [f"depth {args.get('depth', 1)}"]
-        if tool == "search":
-            query = self._one_line(str(args.get("query", "")), 72)
-            scope = str(args.get("path", "."))
-            glob = args.get("glob")
-            detail = f"in {scope}"
-            if glob:
-                detail += f" · {glob}"
-            return json.dumps(query, ensure_ascii=False), [detail]
-        if tool == "shell":
-            command = self._one_line(str(args.get("command", "")), 100)
-            return "", [f"$ {command}"]
-        details = [
-            f"{name}: {self._format_value(value)}" for name, value in args.items()
-        ]
-        return "", details
+        request = self.tool_presenters.request(tool, args)
+        if request.kind == "shell" and request.subject:
+            return "", [f"$ {request.subject}", *request.details]
+        return request.subject, list(request.details)
 
-    def _render_tool_result(self, data: Mapping[str, Any]) -> None:
+    def _render_tool_result(
+        self,
+        data: Mapping[str, Any],
+        *,
+        completed: PresentationToolCompleted | None = None,
+    ) -> None:
         result = data.get("result", {})
         if not isinstance(result, Mapping):
             return
@@ -727,19 +810,77 @@ class TerminalRenderer:
         output = str(result.get("output", ""))
         if tool == "model_protocol":
             self._finish_exploration()
-            self._print(Text("• 模型响应格式异常，正在重试…", style="yellow"))
-            if self.verbose:
-                self._print(Text(f"  {output}", style=MUTED))
+            self._print(
+                Text("• 模型响应格式异常，正在重试…", style="yellow")
+            )
+            self._print(Text(f"  {output}", style=MUTED))
             return
-        elapsed = self._elapsed(self._tool_started_at)
-        summary, details = self._tool_result_summary(tool, output, success)
+        args = result.get("args", {})
+        args = args if isinstance(args, Mapping) else {}
+        raw_result = ToolResult(tool, args, success, output)
+        if completed is None:
+            presented = self.tool_presenters.result(
+                raw_result,
+                expanded=self.verbose,
+            )
+            for renderable in self._tool_result_renderables(
+                tool,
+                success,
+                presented.summary,
+                presented.preview,
+                self._elapsed(self._tool_started_at),
+            ):
+                self._print(renderable)
+            return
+
+        elapsed = (
+            self._format_duration(completed.duration_ms)
+            if completed.duration_ms is not None
+            else self._elapsed(self._tool_started_at)
+        )
+        compact = completed.result
+        compact_renderables = self._tool_result_renderables(
+            tool,
+            success,
+            compact.summary,
+            compact.preview,
+            elapsed,
+        )
+        expanded = self.tool_presenters.result(raw_result, expanded=True)
+        expanded_renderables = self._tool_result_renderables(
+            tool,
+            success,
+            expanded.summary,
+            expanded.preview,
+            elapsed,
+        )
+        if self._block_handler is not None:
+            self._block_handler(
+                f"tool-result:{completed.call_id}",
+                compact_renderables,
+                expanded_renderables if compact.truncated else None,
+                {},
+            )
+            return
+        renderables = expanded_renderables if self.verbose else compact_renderables
+        for renderable in renderables:
+            self._print(renderable)
+
+    @staticmethod
+    def _tool_result_renderables(
+        tool: str,
+        success: bool,
+        summary: str,
+        details: tuple[str, ...],
+        elapsed: str,
+    ) -> tuple[Text, ...]:
         marker = "└" if success else "└ ✕"
         style = "green" if success else "red"
         if success and tool == "shell" and not summary.startswith("Exited with code 0"):
             marker = "└ !"
             style = "yellow"
         suffix = f" · {elapsed}" if elapsed != "0ms" else ""
-        self._print(Text(f"  {marker} {summary}{suffix}", style=style))
+        renderables = [Text(f"  {marker} {summary}{suffix}", style=style)]
         for detail in details:
             detail_style = MUTED if success else "red"
             if success and tool == "edit_file":
@@ -749,104 +890,22 @@ class TerminalRenderer:
                     detail_style = "red"
                 elif detail.startswith("@@"):
                     detail_style = ACCENT
-            self._print(Text(f"    │ {detail}", style=detail_style))
+            renderables.append(Text(f"    │ {detail}", style=detail_style))
+        return tuple(renderables)
 
     def _tool_result_summary(
         self, tool: str, output: str, success: bool
     ) -> tuple[str, list[str]]:
-        if not success:
-            return "Failed", self._preview_lines(output)
-        if tool == "read_file":
-            range_match = re.match(r"^\[lines (\d+)-(\d+) of (\d+)\]", output)
-            if range_match:
-                start, end, total = range_match.groups()
-                details = self._preview_lines(output) if self.verbose else []
-                return f"Read lines {start}-{end} of {total}", details
-            if output == "[file is empty: 0 lines]":
-                return "File is empty", []
-            line_count = len(output.splitlines())
-            size = len(output.encode("utf-8"))
-            details = self._preview_lines(output) if self.verbose else []
-            return f"Read {line_count:,} lines · {self._format_bytes(size)}", details
-        if tool == "write_file":
-            return output or "File written", []
-        if tool == "edit_file":
-            lines = output.splitlines()
-            summary = lines[0].removeprefix("updated ") if lines else "file"
-            diff = lines[1:]
-            # The request already names the file. Keep every hunk rather than
-            # spending the ordinary log preview budget on diff headers/context.
-            if len(diff) >= 2 and diff[0].startswith("--- ") and diff[1].startswith("+++ "):
-                diff = diff[2:]
-            added = sum(line.startswith("+") for line in diff)
-            removed = sum(line.startswith("-") for line in diff)
-            return f"Updated {summary} · +{added} / -{removed} lines", diff
-        if tool == "find_files":
-            if output == "no files":
-                return "No files", []
-            lines = output.splitlines()
-            return f"Found {len(lines):,} files", self._preview_lines(output)
-        if tool == "list_files":
-            if output == "empty directory":
-                return "Empty directory", []
-            lines = output.splitlines()
-            return f"Listed {len(lines):,} entries", self._preview_lines(output)
-        if tool == "search":
-            if output == "no matches":
-                return "No matches", []
-            lines = output.splitlines()
-            return f"Found {len(lines):,} matches", self._preview_lines(output)
-        if tool == "shell":
-            return self._shell_summary(output)
-        return "Done", self._preview_lines(output) if output else []
-
-    def _shell_summary(self, output: str) -> tuple[str, list[str]]:
-        try:
-            parsed = json.loads(output)
-        except (json.JSONDecodeError, TypeError):
-            return "Completed", self._preview_lines(output)
-        if not isinstance(parsed, dict):
-            return "Completed", self._preview_lines(output)
-        exit_code = parsed.get("exit_code")
-        stdout = str(parsed.get("stdout", "")).strip()
-        stderr = str(parsed.get("stderr", "")).strip()
-        details = "\n".join(part for part in (stdout, stderr) if part)
-        return f"Exited with code {exit_code}", self._preview_lines(details)
-
-    def _preview_lines(self, value: str) -> list[str]:
-        if not value:
-            return []
-        original = value.splitlines()
-        if self.verbose:
-            return original
-        character_clipped = len(value) > self.output_limit
-        clipped = self._truncate(value).splitlines()
-        visible = clipped[: self.output_lines]
-        omitted_lines = max(0, len(original) - len(visible))
-        if omitted_lines:
-            noun = "line" if omitted_lines == 1 else "lines"
-            visible.append(f"… {omitted_lines:,} more {noun} · /verbose to expand")
-        elif character_clipped:
-            visible.append("… output truncated · /verbose to expand")
-        return visible
-
-    def _truncate(self, value: str) -> str:
-        if self.verbose or len(value) <= self.output_limit:
-            return value
-        return value[: self.output_limit].rstrip()
+        result = self.tool_presenters.result(
+            ToolResult(tool, {}, success, output),
+            expanded=self.verbose,
+        )
+        return result.summary, list(result.preview)
 
     @staticmethod
     def _one_line(value: str, limit: int) -> str:
         value = " ".join(value.split())
         return value if len(value) <= limit else value[: limit - 1] + "…"
-
-    @staticmethod
-    def _format_bytes(size: int) -> str:
-        if size < 1024:
-            return f"{size} B"
-        if size < 1024 * 1024:
-            return f"{size / 1024:.1f} KB"
-        return f"{size / (1024 * 1024):.1f} MB"
 
     @staticmethod
     def _elapsed(started_at: float | None) -> str:
@@ -860,10 +919,10 @@ class TerminalRenderer:
         return f"{int(seconds // 60)}m {int(seconds % 60)}s"
 
     @staticmethod
-    def _format_value(value: Any) -> str:
-        if isinstance(value, str):
-            return value
-        try:
-            return json.dumps(value, ensure_ascii=False, sort_keys=True)
-        except (TypeError, ValueError):
-            return repr(value)
+    def _format_duration(duration_ms: int) -> str:
+        if duration_ms < 1000:
+            return f"{duration_ms}ms"
+        seconds = duration_ms / 1000
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        return f"{int(seconds // 60)}m {int(seconds % 60)}s"

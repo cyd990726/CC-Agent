@@ -1,4 +1,6 @@
+import json
 import threading
+import tempfile
 import time
 import unittest
 from io import StringIO
@@ -15,6 +17,9 @@ from rich.console import Console
 
 from agent.events import AgentEvent, EventType
 from agent.runtime import AgentRuntime
+from agent.session import SessionRecord, SessionStore
+from agent.state import AgentState
+from tools.base import ToolResult
 from ui.logo import LOGO_LINES, render_logo
 from ui.permissions import SessionPermissionHandler
 from ui.renderer import TerminalRenderer
@@ -55,6 +60,8 @@ class TerminalAppTests(unittest.TestCase):
         app._ui_active = True
         renderer.set_activity_handler(app._update_activity)
         renderer.set_output_handler(app._write_transcript)
+        renderer.set_render_handler(app._append_renderables)
+        renderer.set_block_handler(app._upsert_renderables)
 
     @staticmethod
     def _transcript_text(app: TerminalApp) -> str:
@@ -72,6 +79,88 @@ class TerminalAppTests(unittest.TestCase):
         self.assertEqual(rendered.splitlines(), list(LOGO_LINES))
         self.assertIn("o.o", rendered)
 
+    def test_initial_transcript_line_cache_contains_header(self) -> None:
+        output = StringIO()
+        console = Console(file=output, force_terminal=False, width=80)
+        app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=Path("/tmp/example"),
+        )
+
+        app._reset_transcript_to_header()
+        self.assertEqual(app._transcript_blocks[0].block_id, "session:header")
+
+        rendered = "".join(
+            text
+            for line in app._transcript_line_fragments
+            for _style, text in line
+        )
+        self.assertIn("MINI AGENT", rendered)
+        self.assertIn("test-model", rendered)
+
+    def test_header_logo_animates_before_transcript_output(self) -> None:
+        output = StringIO()
+        console = Console(file=output, force_terminal=False, width=80)
+        app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=Path("/tmp/example"),
+        )
+        with patch("ui.terminal.time.monotonic", return_value=1.0):
+            app._reset_transcript_to_header()
+        before = "".join(app._transcript)
+        app._ui_active = True
+
+        with patch("ui.terminal.time.monotonic", return_value=1.4):
+            changed = app._advance_header_animation()
+
+        self.assertTrue(changed)
+        self.assertNotEqual("".join(app._transcript), before)
+
+    def test_header_logo_stops_animating_after_transcript_output(self) -> None:
+        output = StringIO()
+        console = Console(file=output, force_terminal=False, width=80)
+        app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=Path("/tmp/example"),
+        )
+        app._reset_transcript_to_header()
+        app._ui_active = True
+        app._append_renderables(("answer",))
+        before = "".join(app._transcript)
+
+        with patch("ui.terminal.time.monotonic", return_value=time.monotonic() + 1):
+            changed = app._advance_header_animation()
+
+        self.assertFalse(changed)
+        self.assertEqual("".join(app._transcript), before)
+
+    def test_header_includes_logo_and_session_metadata(self) -> None:
+        console = Console(file=StringIO(), force_terminal=False)
+        app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=Path("/tmp/example"),
+        )
+
+        console.print(app._header_content())
+        header = console.file.getvalue()
+
+        self.assertIn("MINI AGENT", header)
+        self.assertIn("test-model", header)
+        self.assertIn(str(Path("/tmp/example")), header)
+        self.assertIn("o.o", header)
+
     def test_status_line_contains_model_and_workspace(self) -> None:
         output = StringIO()
         console = Console(file=output, force_terminal=False)
@@ -82,6 +171,7 @@ class TerminalAppTests(unittest.TestCase):
             console,
             model_name="test-model",
             workspace=workspace,
+            session=SessionRecord.new(workspace, title="Feature work"),
             prompt=lambda _message: "/exit",
         )
 
@@ -91,9 +181,419 @@ class TerminalAppTests(unittest.TestCase):
         self.assertIn("test-model", rendered)
         expected_path = str(workspace)
         self.assertIn(expected_path, rendered)
+        self.assertIn("Feature work", rendered)
+        self.assertLess(rendered.index(expected_path), rendered.index("Feature work"))
         model_style = next(style for style, text in fragments if text == "test-model")
         path_style = next(style for style, text in fragments if text == expected_path)
+        session_style = next(style for style, text in fragments if text == "Feature work")
         self.assertNotEqual(model_style, path_style)
+        self.assertNotEqual(path_style, session_style)
+
+    def test_status_line_hides_default_or_missing_session_name(self) -> None:
+        output = StringIO()
+        console = Console(file=output, force_terminal=False)
+        workspace = Path("/tmp/example")
+        default_session_app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=workspace,
+            session=SessionRecord.new(workspace),
+        )
+        temporary_app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=workspace,
+        )
+
+        default_text = "".join(text for _style, text in default_session_app._status_fragments())
+        temporary_text = "".join(text for _style, text in temporary_app._status_fragments())
+
+        self.assertNotIn("New session", default_text)
+        self.assertNotIn(default_session_app.session.id, default_text)
+        self.assertNotIn("temporary", temporary_text)
+
+    def test_activity_line_shows_session_token_usage_on_the_right(self) -> None:
+        output = StringIO()
+        console = Console(file=output, force_terminal=False)
+        workspace = Path("/tmp/example")
+        session = SessionRecord.new(workspace, title="Feature work")
+        session.turns = [
+            {
+                "task": "inspect",
+                "tools": [],
+                "usage": {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 250,
+                    "total_tokens": 1250,
+                },
+            }
+        ]
+        app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=workspace,
+            session=session,
+            prompt=lambda _message: "/exit",
+        )
+        fake_app = Mock()
+        fake_app.output.get_size.return_value.columns = 60
+
+        with patch("ui.terminal.get_app", return_value=fake_app):
+            rendered = "".join(text for _style, text in app._activity_fragments())
+
+        self.assertTrue(rendered.endswith(" 1.2k tokens "))
+
+    def test_activity_remains_visible_while_browsing_history(self) -> None:
+        from dataclasses import replace
+
+        console = Console(file=StringIO(), force_terminal=False)
+        app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            TerminalRenderer(console),
+            console,
+            model_name="test-model",
+            workspace=Path("/tmp/example"),
+        )
+        fake_app = Mock()
+        fake_app.output.get_size.return_value.columns = 100
+        app._terminal_view_state = replace(
+            app._terminal_view_state, follow_tail=False, unseen_count=5
+        )
+        app._transcript_cursor_line = 0
+        app._transcript_window = Mock()
+        app._transcript_window._view_anchor = object()
+        app._update_activity("Reading files", time.monotonic() - 3)
+
+        with patch("ui.terminal.get_app", return_value=fake_app):
+            for selecting in (False, True):
+                with self.subTest(selecting=selecting):
+                    app._selection_control = Mock() if selecting else None
+                    text = "".join(part for _style, part in app._activity_fragments())
+                    self.assertIn("Reading files", text)
+                    self.assertNotIn("正在查看历史", text)
+                    self.assertNotIn("条新内容", text)
+                    self.assertNotIn("复制", text)
+            app._selection_control = None
+            app._update_activity(None, None)
+            text = "".join(part for _style, part in app._activity_fragments())
+            self.assertEqual(text, "")
+
+    def test_first_task_updates_session_title_before_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = Path("/tmp/example")
+            store = SessionStore(workspace, root=root / "data")
+            session = store.draft()
+            console = Console(file=StringIO(), force_terminal=False)
+            app = TerminalApp(
+                Mock(spec=AgentRuntime),
+                TerminalRenderer(console),
+                console,
+                model_name="test-model",
+                workspace=workspace,
+                session_store=store,
+                session=session,
+            )
+
+            self.assertIsNone(store.load(session.id))
+            app._record_task_submission("fix startup resume behavior")
+
+            status = "".join(text for _style, text in app._status_fragments())
+            saved = store.load(session.id)
+
+        self.assertIn("fix startup resume behavior", status)
+        self.assertIsNotNone(saved)
+        assert saved is not None
+        self.assertEqual(saved.title, "fix startup resume behavior")
+        self.assertEqual(saved.tasks, ["fix startup resume behavior"])
+
+    def test_interactive_submit_does_not_save_session_on_enter_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = Path("/tmp/example")
+            store = SessionStore(workspace, root=root / "data")
+            session = store.draft()
+            store.save = Mock(side_effect=AssertionError("save should be deferred"))
+            console = Console(file=StringIO(), force_terminal=False)
+            app = TerminalApp(
+                Mock(spec=AgentRuntime),
+                TerminalRenderer(console),
+                console,
+                model_name="test-model",
+                workspace=workspace,
+                session_store=store,
+                session=session,
+            )
+            with create_pipe_input() as pipe_input:
+                application = app._create_application(input=pipe_input, output=DummyOutput())
+            assert app._input_field is not None
+            app._input_field.text = "inspect files"
+
+            app._submit_input(app._input_field, application)
+
+        self.assertEqual(app._input_field.text, "")
+        self.assertEqual(app.history, ["inspect files"])
+        self.assertEqual(len(session.turns), 1)
+        self.assertEqual(app._task_queue.get_nowait().task, "inspect files")
+
+    def test_tool_result_is_checkpointed_before_task_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = Path("/tmp/example")
+            store = SessionStore(workspace, root=root / "data")
+            session = store.draft()
+            console = Console(file=StringIO(), force_terminal=False)
+            app = TerminalApp(
+                Mock(spec=AgentRuntime),
+                TerminalRenderer(console),
+                console,
+                model_name="test-model",
+                workspace=workspace,
+                session_store=store,
+                session=session,
+            )
+            turn_index = app._record_task_submission("inspect files")
+
+            app._checkpoint_session_event(
+                "inspect files",
+                AgentEvent(
+                    EventType.MODEL_USAGE,
+                    {
+                        "step": 1,
+                        "usage": {
+                            "prompt_tokens": 12,
+                            "completion_tokens": 3,
+                            "total_tokens": 15,
+                        },
+                    },
+                ),
+                turn_index,
+            )
+            app._checkpoint_session_event(
+                "inspect files",
+                AgentEvent(EventType.TOOL_STARTED, {"tool": "list_files"}),
+                turn_index,
+            )
+            running = store.load(session.id)
+            app._checkpoint_session_event(
+                "inspect files",
+                AgentEvent(
+                    EventType.TOOL_COMPLETED,
+                    {
+                        "result": {
+                            "tool": "list_files",
+                            "args": {"path": "."},
+                            "success": True,
+                            "output": "README.md",
+                        }
+                    },
+                ),
+                turn_index,
+            )
+            saved = store.load(session.id)
+
+        self.assertIsNotNone(running)
+        assert running is not None
+        self.assertEqual(running.turns[0]["status"], "running")
+        self.assertEqual(running.turns[0]["current_tool"], "list_files")
+        self.assertIsNotNone(saved)
+        assert saved is not None
+        self.assertEqual(saved.turns[0]["status"], "running")
+        self.assertEqual(saved.turns[0]["tools"][0]["tool"], "list_files")
+        self.assertEqual(saved.turns[0]["tools"][0]["output"], "README.md")
+        self.assertEqual(saved.turns[0]["usage"]["total_tokens"], 15)
+        self.assertEqual(saved.messages[0], {"role": "user", "content": "inspect files"})
+        self.assertTrue(saved.messages[1]["content"].startswith("Observation:"))
+        observation = json.loads(saved.messages[1]["content"].split("\n", 1)[1])
+        self.assertEqual(observation["tool"], "list_files")
+        self.assertEqual(observation["output"], "README.md")
+
+    def test_cancelled_turn_context_is_available_to_next_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = Path("/tmp/example")
+            store = SessionStore(workspace, root=root / "data")
+            session = store.draft()
+            console = Console(file=StringIO(), force_terminal=False)
+            runtime = Mock(spec=AgentRuntime)
+            captured: dict[str, list[dict[str, str]] | None] = {}
+
+            app = TerminalApp(
+                runtime,
+                TerminalRenderer(console),
+                console,
+                model_name="test-model",
+                workspace=workspace,
+                session_store=store,
+                session=session,
+            )
+            first_turn = app._record_task_submission("inspect architecture")
+            app._checkpoint_session_event(
+                "inspect architecture",
+                AgentEvent(
+                    EventType.MODEL_COMPLETED,
+                    {
+                        "response": {
+                            "action": {
+                                "tool": "read_file",
+                                "args": {"path": "README.md"},
+                            }
+                        }
+                    },
+                ),
+                first_turn,
+            )
+            app._checkpoint_session_event(
+                "inspect architecture",
+                AgentEvent(
+                    EventType.TOOL_COMPLETED,
+                    {
+                        "result": {
+                            "tool": "read_file",
+                            "args": {"path": "README.md"},
+                            "success": True,
+                            "output": "project overview",
+                        }
+                    },
+                ),
+                first_turn,
+            )
+            app._checkpoint_session_event(
+                "inspect architecture",
+                AgentEvent(EventType.RUN_CANCELLED, {}),
+                first_turn,
+            )
+
+            def run(task, *, prior_messages, on_event, cancellation):
+                captured["prior_messages"] = prior_messages
+                state = AgentState(current_task=task)
+                state.messages = [
+                    *(prior_messages or []),
+                    {"role": "user", "content": task},
+                    {"role": "assistant", "content": '{"final_answer": "continued"}'},
+                ]
+                state.final_answer = "continued"
+                state.finished = True
+                return state
+
+            runtime.run.side_effect = run
+            second_turn = app._record_task_submission("continue previous task")
+
+            self.assertTrue(
+                app.run_task(
+                    "continue previous task",
+                    checkpoint_turn_index=second_turn,
+                    task_recorded=True,
+                )
+            )
+
+        prior_messages = captured["prior_messages"]
+        self.assertIsNotNone(prior_messages)
+        assert prior_messages is not None
+        contents = [message["content"] for message in prior_messages]
+        self.assertIn("inspect architecture", contents)
+        self.assertNotIn("continue previous task", contents)
+        self.assertTrue(
+            any(
+                content.startswith("Observation:")
+                and "project overview" in content
+                for content in contents
+            )
+        )
+
+    def test_run_task_completes_checkpointed_turn_without_duplicate_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = Path("/tmp/example")
+            store = SessionStore(workspace, root=root / "data")
+            session = store.draft()
+            console = Console(file=StringIO(), force_terminal=False)
+            runtime = Mock(spec=AgentRuntime)
+
+            def run(task, *, prior_messages, on_event, cancellation):
+                on_event(
+                    AgentEvent(
+                        EventType.TOOL_COMPLETED,
+                        {
+                            "result": {
+                                "tool": "read_file",
+                                "args": {"path": "README.md"},
+                                "success": True,
+                                "output": "content",
+                            }
+                        },
+                    )
+                )
+                on_event(
+                    AgentEvent(
+                        EventType.RUN_COMPLETED,
+                        {"answer": "done", "steps": 2},
+                    )
+                )
+                state = AgentState(current_task=task)
+                state.messages = [{"role": "user", "content": task}]
+                state.tool_results = [
+                    ToolResult("read_file", {"path": "README.md"}, True, "content")
+                ]
+                state.final_answer = "done"
+                state.finished = True
+                return state
+
+            runtime.run.side_effect = run
+            app = TerminalApp(
+                runtime,
+                TerminalRenderer(console),
+                console,
+                model_name="test-model",
+                workspace=workspace,
+                session_store=store,
+                session=session,
+            )
+            turn_index = app._record_task_submission("read docs")
+
+            self.assertTrue(
+                app.run_task("read docs", checkpoint_turn_index=turn_index)
+            )
+            saved = store.load(session.id)
+
+        self.assertIsNotNone(saved)
+        assert saved is not None
+        self.assertEqual(saved.tasks, ["read docs"])
+        self.assertEqual(len(saved.turns), 1)
+        self.assertEqual(saved.turns[0]["status"], "completed")
+        self.assertEqual(saved.turns[0]["answer"], "done")
+        self.assertEqual(saved.turns[0]["tools"][0]["tool"], "read_file")
+
+    def test_exit_before_first_task_does_not_persist_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            store = SessionStore(workspace, root=root / "data")
+            session = store.draft()
+            console = Console(file=StringIO(), force_terminal=False)
+            app = TerminalApp(
+                Mock(spec=AgentRuntime),
+                TerminalRenderer(console),
+                console,
+                model_name="test-model",
+                workspace=workspace,
+                session_store=store,
+                session=session,
+                prompt=lambda _message: "/exit",
+            )
+
+            result = app.run()
+
+            self.assertEqual(result, 0)
+            self.assertIsNone(store.load(session.id))
+            self.assertEqual(store.list(), [])
 
     def test_interactive_activity_has_own_row_and_preserves_status(self) -> None:
         output = StringIO()
@@ -147,6 +647,7 @@ class TerminalAppTests(unittest.TestCase):
         )
         self._attach_renderer(app, renderer)
 
+        renderer(AgentEvent(EventType.RUN_STARTED, {"task": "test"}))
         renderer(
             AgentEvent(
                 EventType.TOOL_REQUESTED,
@@ -169,6 +670,17 @@ class TerminalAppTests(unittest.TestCase):
         rendered_before_close = self._transcript_text(app)
         self.assertNotIn("Explored", rendered_before_close)
         self.assertIn("Read README.md", rendered_before_close)
+        self.assertNotIn("contents", rendered_before_close)
+        self.assertTrue(
+            any(
+                block.block_id is not None
+                and block.block_id.startswith("tool-result:")
+                for block in app._transcript_blocks
+            )
+        )
+
+        app._handle_command("/verbose")
+        self.assertIn("contents", self._transcript_text(app))
 
         renderer.close()
 
@@ -189,6 +701,7 @@ class TerminalAppTests(unittest.TestCase):
         )
         self._attach_renderer(app, renderer)
 
+        renderer(AgentEvent(EventType.RUN_STARTED, {"task": "test"}))
         renderer(
             AgentEvent(
                 EventType.TOOL_REQUESTED,
@@ -233,6 +746,7 @@ class TerminalAppTests(unittest.TestCase):
         assert app._input_field is not None
         app._input_field.text = "正在输入的草稿"
 
+        renderer(AgentEvent(EventType.RUN_STARTED, {"task": "test"}))
         renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
         renderer(
             AgentEvent(
@@ -367,6 +881,171 @@ class TerminalAppTests(unittest.TestCase):
             [call.args[0] for call in runtime.run.call_args_list],
             ["first task", "second task"],
         )
+        self.assertEqual(app.history, ["first task", "second task"])
+
+    def test_resume_command_switches_to_saved_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            store = SessionStore(workspace, root=root / "data")
+            first = store.create(title="First")
+            first.tasks = ["old task"]
+            first.messages = [{"role": "user", "content": "old task"}]
+            store.save(first)
+            second = store.create(title="Second")
+
+            console = Console(file=StringIO(), force_terminal=False)
+            app = TerminalApp(
+                Mock(spec=AgentRuntime),
+                TerminalRenderer(console),
+                console,
+                model_name="test-model",
+                workspace=workspace,
+                session_store=store,
+                session=second,
+            )
+
+            app._handle_command(f"/resume {first.id}")
+
+        self.assertEqual(app.session.id, first.id)
+        self.assertEqual(app.history, ["old task"])
+        self.assertIn("已恢复会话", console.file.getvalue())
+
+    def test_resume_renders_saved_answer_as_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            store = SessionStore(workspace, root=root / "data")
+            saved = store.create(title="Markdown history")
+            saved.tasks = ["show release steps"]
+            saved.turns = [
+                {
+                    "task": "show release steps",
+                    "answer": (
+                        "## Release\n\n"
+                        "- Build package\n"
+                        "- Publish package\n\n"
+                        "```bash\npython -m build\n```"
+                    ),
+                    "tools": [],
+                    "status": "completed",
+                }
+            ]
+            store.save(saved)
+
+            output = StringIO()
+            console = Console(file=output, force_terminal=False, width=80)
+            app = TerminalApp(
+                Mock(spec=AgentRuntime),
+                TerminalRenderer(console),
+                console,
+                model_name="test-model",
+                workspace=workspace,
+                session_store=store,
+                session=store.draft(),
+            )
+            app._ui_active = True
+
+            app._handle_command(f"/resume {saved.id}")
+            rendered = self._transcript_text(app)
+
+        self.assertIn("✦ Mini Agent", rendered)
+        self.assertIn("Release", rendered)
+        self.assertIn("• Build package", rendered)
+        self.assertIn("python -m build", rendered)
+        self.assertNotIn("## Release", rendered)
+        self.assertNotIn("- Build package", rendered)
+        self.assertNotIn("```bash", rendered)
+
+    def test_new_session_is_persisted_only_after_first_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            store = SessionStore(workspace, root=root / "data")
+            previous = store.create(title="Previous")
+            previous.tasks = ["previous task"]
+            store.save(previous)
+            console = Console(file=StringIO(), force_terminal=False)
+            app = TerminalApp(
+                Mock(spec=AgentRuntime),
+                TerminalRenderer(console),
+                console,
+                model_name="test-model",
+                workspace=workspace,
+                session_store=store,
+                session=previous,
+            )
+
+            app._handle_command("/new")
+            draft_id = app.session.id
+            before_task = store.list()
+            app._record_task_submission("first task")
+            after_task = store.load(draft_id)
+
+        self.assertEqual([session.id for session in before_task], [previous.id])
+        self.assertIsNotNone(after_task)
+        assert after_task is not None
+        self.assertEqual(after_task.tasks, ["first task"])
+        self.assertEqual(after_task.title, "first task")
+
+    def test_resume_command_opens_selector_and_confirms_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            store = SessionStore(workspace, root=root / "data")
+            first = store.create(title="First")
+            first.tasks = ["first task"]
+            first.turns = [
+                {
+                    "task": "first task",
+                    "answer": None,
+                    "tools": [
+                        {
+                            "tool": "read_file",
+                            "success": True,
+                            "output": "content",
+                        }
+                    ],
+                    "status": "running",
+                    "current_tool": "search",
+                }
+            ]
+            store.save(first)
+            second = store.create(title="Second")
+            second.tasks = ["second task"]
+            store.save(second)
+
+            console = Console(file=StringIO(), force_terminal=False)
+            app = TerminalApp(
+                Mock(spec=AgentRuntime),
+                TerminalRenderer(console),
+                console,
+                model_name="test-model",
+                workspace=workspace,
+                session_store=store,
+                session=second,
+            )
+            app._ui_active = True
+
+            app._handle_command("/resume")
+            self.assertTrue(app._resume_selector_open)
+            self.assertGreaterEqual(len(app._resume_candidates), 2)
+            self.assertEqual(app._resume_candidates[app._resume_selection].id, second.id)
+
+            app._move_overlay(1)
+            app._confirm_resume_selection()
+
+        self.assertFalse(app._resume_selector_open)
+        self.assertEqual(app.session.id, first.id)
+        self.assertEqual(app.history, ["first task"])
+        self.assertIn("first task", self._transcript_text(app))
+        self.assertIn("status: running", self._transcript_text(app))
+        self.assertIn("running search", self._transcript_text(app))
+        self.assertIn("last read_file ok", self._transcript_text(app))
 
     def test_unified_application_accepts_input_while_worker_runs(self) -> None:
         output = StringIO()
@@ -416,6 +1095,18 @@ class TerminalAppTests(unittest.TestCase):
             permission_handler=handler,
         )
         handler.set_request_callback(app._request_permission)
+        app.renderer.presentation_store.handle(
+            AgentEvent(EventType.RUN_STARTED, {"task": "test"})
+        )
+        app.renderer.presentation_store.handle(
+            AgentEvent(
+                EventType.TOOL_REQUESTED,
+                {"tool": "shell", "args": {"command": "pwd"}},
+            )
+        )
+        app.renderer.presentation_store.handle(
+            AgentEvent(EventType.TOOL_STARTED, {"tool": "shell"})
+        )
         result: list[bool] = []
         worker = threading.Thread(
             target=lambda: result.append(handler("shell", {"command": "pwd"}))
@@ -427,11 +1118,21 @@ class TerminalAppTests(unittest.TestCase):
             time.sleep(0.001)
         self.assertTrue(app._activate_permission_request())
         self.assertEqual(app._active_permission.tool_name, "shell")
+        self.assertEqual(
+            len(app.renderer.presentation_store.state.permission_requests),
+            1,
+        )
+        self.assertIsNotNone(app._terminal_view_state.active_permission_id)
         app._resolve_permission("y")
         worker.join(timeout=1)
 
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, [True])
+        self.assertEqual(
+            app.renderer.presentation_store.state.permission_requests,
+            (),
+        )
+        self.assertIsNone(app._terminal_view_state.active_permission_id)
         self.assertEqual(console.file.getvalue(), "")
 
 
@@ -518,6 +1219,16 @@ class PermissionHandlerTests(unittest.TestCase):
         self.assertFalse(handler("fetch_url", {"url": "https://example.com"}))
         self.assertEqual(len(prompts), 1)
 
+    def test_remember_does_not_require_permission(self) -> None:
+        prompts: list[str] = []
+        handler = SessionPermissionHandler(
+            self.console,
+            ask=lambda prompt: prompts.append(prompt) or "n",
+        )
+
+        self.assertTrue(handler("remember", {"content": "Prefer concise output."}))
+        self.assertEqual(prompts, [])
+
 
 class RendererTests(unittest.TestCase):
     class FakeLive:
@@ -544,7 +1255,12 @@ class RendererTests(unittest.TestCase):
     def setUp(self) -> None:
         self.FakeLive.instances = []
 
-    def test_edit_result_shows_complete_diff_without_verbose(self) -> None:
+    @staticmethod
+    def _start_model(renderer: TerminalRenderer, step: int = 1) -> None:
+        renderer(AgentEvent(EventType.RUN_STARTED, {"task": "test"}))
+        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": step}))
+
+    def test_edit_result_is_compact_by_default_and_expands_in_verbose(self) -> None:
         import difflib
 
         before = "".join(f"line {index}\n" for index in range(30))
@@ -553,27 +1269,31 @@ class RendererTests(unittest.TestCase):
         diff = "".join(difflib.unified_diff(
             before.splitlines(keepends=True), after.splitlines(keepends=True),
             fromfile="a/example.py", tofile="b/example.py"))
-        for interactive in (False, True):
-            with self.subTest(interactive=interactive):
+        for verbose in (False, True):
+            with self.subTest(verbose=verbose):
                 output = StringIO()
                 renderer = TerminalRenderer(Console(
-                    file=output, force_terminal=False, width=100))
-                chunks = []
-                if interactive:
-                    renderer.set_output_handler(chunks.append)
+                    file=output, force_terminal=False, width=100),
+                    verbose=verbose,
+                )
                 renderer(AgentEvent(EventType.TOOL_COMPLETED, {"result": {
                     "tool": "edit_file", "success": True,
                     "output": "updated example.py\n" + diff,
                 }}))
-                rendered = "".join(chunks) if interactive else output.getvalue()
+                rendered = output.getvalue()
                 self.assertIn("+2 / -2 lines", rendered)
                 for line in diff.splitlines()[2:]:
-                    self.assertIn(line, rendered)
-                self.assertNotIn("/verbose", rendered)
+                    if verbose:
+                        self.assertIn(line, rendered)
+                    else:
+                        self.assertNotIn(line, rendered)
                 self.assertNotIn("--- a/example.py", rendered)
 
     def test_edit_diff_colors_and_newline_marker(self) -> None:
-        renderer = TerminalRenderer(Console(file=StringIO(), force_terminal=False))
+        renderer = TerminalRenderer(
+            Console(file=StringIO(), force_terminal=False),
+            verbose=True,
+        )
         rows = []
         renderer.set_render_handler(lambda objects, options: rows.extend(objects))
         renderer(AgentEvent(EventType.TOOL_COMPLETED, {"result": {
@@ -594,7 +1314,7 @@ class RendererTests(unittest.TestCase):
         output = StringIO()
         renderer = TerminalRenderer(Console(file=output, force_terminal=False))
         answer = "\n\nFirst paragraph.\n\nTAIL remains intact."
-        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        self._start_model(renderer)
         renderer(AgentEvent(EventType.MODEL_DELTA, {
             "delta": json.dumps({"final_answer": answer}),
         }))
@@ -620,6 +1340,8 @@ class RendererTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertLess(rendered.index("Read README.md"), rendered.index("模型响应格式异常"))
         self.assertNotIn("Failed", rendered)
+        self.assertIn("model did not return valid JSON", rendered)
+        self.assertFalse(renderer.verbose)
         self.assertIsNone(renderer._exploration)
 
     def test_toggle_verbose(self) -> None:
@@ -636,6 +1358,7 @@ class RendererTests(unittest.TestCase):
         renderer = TerminalRenderer(Console(file=output, force_terminal=False))
         renderer.set_output_handler(chunks.append)
 
+        renderer(AgentEvent(EventType.RUN_STARTED, {"task": "test"}))
         renderer(
             AgentEvent(
                 EventType.RUN_COMPLETED,
@@ -652,7 +1375,7 @@ class RendererTests(unittest.TestCase):
         console = Console(file=output, force_terminal=False)
         renderer = TerminalRenderer(console)
 
-        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 4}))
+        self._start_model(renderer, step=4)
 
         self.assertIsNotNone(renderer._status)
         assert renderer._status is not None
@@ -668,7 +1391,7 @@ class RendererTests(unittest.TestCase):
         output = StringIO()
         renderer = TerminalRenderer(Console(file=output, force_terminal=False))
 
-        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        self._start_model(renderer)
         renderer(
             AgentEvent(
                 EventType.MODEL_DELTA,
@@ -694,7 +1417,7 @@ class RendererTests(unittest.TestCase):
         output = StringIO()
         renderer = TerminalRenderer(Console(file=output, force_terminal=False))
 
-        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        self._start_model(renderer)
         renderer(
             AgentEvent(
                 EventType.MODEL_DELTA,
@@ -722,7 +1445,7 @@ class RendererTests(unittest.TestCase):
         output = StringIO()
         renderer = TerminalRenderer(Console(file=output, force_terminal=False))
 
-        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        self._start_model(renderer)
         renderer(
             AgentEvent(
                 EventType.MODEL_DELTA,
@@ -747,7 +1470,14 @@ class RendererTests(unittest.TestCase):
             Console(file=output, force_terminal=True),
             live_factory=self.FakeLive,
         )
+        previews = []
+        renderer.set_stream_render_handler(
+            lambda objects, options, final: previews.append(
+                (objects, options, final)
+            )
+        )
 
+        self._start_model(renderer)
         renderer(
             AgentEvent(
                 EventType.MODEL_DELTA,
@@ -765,7 +1495,7 @@ class RendererTests(unittest.TestCase):
         )
 
         self.assertEqual(self.FakeLive.instances, [])
-        self.assertNotIn("半行", output.getvalue())
+        self.assertEqual(previews, [])
 
         renderer(
             AgentEvent(
@@ -774,8 +1504,75 @@ class RendererTests(unittest.TestCase):
             )
         )
 
-        self.assertIn("半行", output.getvalue())
-        self.assertIn("下一", output.getvalue())
+        self.assertEqual(len(previews), 1)
+        self.assertFalse(previews[0][2])
+        with renderer.console.capture() as capture:
+            renderer.console.print(*previews[0][0])
+        rendered = capture.get()
+        self.assertIn("半行", rendered)
+        self.assertIn("下一", rendered)
+
+    def test_streaming_markdown_replaces_preview_without_repeating_lists(self) -> None:
+        output = StringIO()
+        console = Console(file=output, force_terminal=False, width=60)
+        renderer = TerminalRenderer(console)
+        app = TerminalApp(
+            Mock(spec=AgentRuntime),
+            renderer,
+            console,
+            model_name="test-model",
+            workspace=Path("/tmp/example"),
+        )
+        renderer.set_render_handler(app._append_renderables)
+        renderer.set_stream_render_handler(app._update_streaming_renderables)
+        answer = (
+            "2. 创建 release CI（我可以帮你加）：\n"
+            "   - push tag 如 v0.1.0 时自动触发\n\n"
+            "   - 先跑测试，再构建 wheel/sdist\n\n"
+            "   - 自动上传\n\n"
+            "3. 发版时只需要：\n\n"
+            "   ```bash\n"
+            "   git tag v0.1.0\n"
+            "   git push origin v0.1.0\n"
+            "   ```\n\n"
+            "   剩下的 CI 自动完成"
+        )
+        chunks = [
+            '{"final_answer":"2. 创建 release CI（我可以帮你加）：\\n'
+            '   - push tag 如 v0.1.0 时自动触发\\n\\n',
+            '   - 先跑测试，再构建 wheel/sdist\\n\\n',
+            '   - 自动上传\\n\\n3. 发版时只需要：\\n\\n',
+            '   ```bash\\n   git tag v0.1.0\\n'
+            '   git push origin v0.1.0\\n',
+            '   ```\\n\\n   剩下的 CI 自动完成"}',
+        ]
+
+        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        for chunk in chunks:
+            renderer(AgentEvent(EventType.MODEL_DELTA, {"delta": chunk}))
+        renderer(
+            AgentEvent(
+                EventType.RUN_COMPLETED,
+                {"answer": answer, "steps": 1},
+            )
+        )
+
+        rendered = "".join(
+            text
+            for style_text in app._transcript
+            for _style, text in to_formatted_text(ANSI(style_text))
+        )
+        for text in (
+            "创建 release CI",
+            "push tag 如 v0.1.0",
+            "先跑测试，再构建 wheel/sdist",
+            "自动上传",
+            "发版时只需要",
+            "git tag v0.1.0",
+            "git push origin v0.1.0",
+            "剩下的 CI 自动完成",
+        ):
+            self.assertEqual(rendered.count(text), 1, text)
 
     def test_streaming_markdown_does_not_split_fenced_code(self) -> None:
         stable = TerminalRenderer._stable_streaming_text
@@ -793,6 +1590,7 @@ class RendererTests(unittest.TestCase):
             live_factory=self.FakeLive,
         )
 
+        self._start_model(renderer)
         renderer(
             AgentEvent(
                 EventType.MODEL_DELTA,
@@ -819,7 +1617,7 @@ class RendererTests(unittest.TestCase):
         )
         answer = "\n\n".join(f"唯一行-{index}" for index in range(40))
 
-        renderer(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+        self._start_model(renderer)
         renderer(
             AgentEvent(
                 EventType.MODEL_DELTA,
@@ -988,6 +1786,7 @@ class RendererTests(unittest.TestCase):
                 renderer = TerminalRenderer(console, live_factory=self.FakeLive)
                 if interactive:
                     renderer.set_activity_handler(lambda *_: None)
+                renderer(AgentEvent(EventType.RUN_STARTED, {"task": "test"}))
                 for tool, path, thought in (
                     ("list_files", "agent/", "Inspecting the runtime next."),
                     ("read_file", "agent/runtime.py", "Found the relevant logic."),

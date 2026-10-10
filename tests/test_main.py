@@ -4,7 +4,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from main import build_parser, load_configuration, load_env_file, recover_cwd
+from agent.session import SessionStore
+from main import (
+    _select_session,
+    build_parser,
+    load_configuration,
+    load_env_file,
+    recover_cwd,
+)
 
 
 class LoadEnvFileTests(unittest.TestCase):
@@ -71,6 +78,44 @@ class LoadEnvFileTests(unittest.TestCase):
             args = build_parser().parse_args([])
 
         self.assertEqual(args.max_steps, 75)
+
+    def test_interactive_start_prepares_unsaved_session_unless_resumed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            store = SessionStore(workspace, root=root / "data")
+            previous = store.create(title="Previous task")
+            previous.tasks = ["previous task"]
+            store.save(previous)
+
+            resumed = _select_session(
+                store,
+                resume="latest",
+                new_session=False,
+                interactive=True,
+            )
+            fresh = _select_session(
+                store,
+                resume=None,
+                new_session=False,
+                interactive=True,
+            )
+            explicit_new = _select_session(
+                store,
+                resume=None,
+                new_session=True,
+                interactive=True,
+            )
+            explicit_new_on_disk = store.load(explicit_new.id)
+            persisted = store.list()
+
+        self.assertEqual(resumed.id, previous.id)
+        self.assertNotEqual(fresh.id, previous.id)
+        self.assertEqual(fresh.title, "New session")
+        self.assertNotEqual(explicit_new.id, previous.id)
+        self.assertIsNone(explicit_new_on_disk)
+        self.assertEqual([session.id for session in persisted], [previous.id])
 
 
 if __name__ == "__main__":

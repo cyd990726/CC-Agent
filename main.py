@@ -9,6 +9,7 @@ from rich.console import Console
 
 from agent.config import run_init, user_config_path
 from agent.diagnostics import run_doctor
+from agent.memory import MemoryStore
 from agent.permissions import PermissionMode
 from agent.runtime import AgentRuntime
 from agent.sandbox import SandboxManager
@@ -19,12 +20,16 @@ from agent.settings import (
     set_environment_defaults,
     user_settings_path,
 )
+
+from agent.session import SessionStore
 from model.llm import ChatCompletionsLLM
 from tools import (
     EditFileTool,
     FetchUrlTool,
     FindFilesTool,
     ListFilesTool,
+    ReadMemoryTool,
+    RememberTool,
     ReadFileTool,
     SearchTool,
     ShellTool,
@@ -114,6 +119,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="show complete tool output",
     )
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const="latest",
+        default=None,
+        help="resume the latest saved session or a specific session id",
+    )
+    parser.add_argument(
+        "--new-session",
+        action="store_true",
+        help="start a fresh session that is saved with its first task",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
 
@@ -159,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
             "执行命令和访问网络；已启用的 shell sandbox 仍会继续生效。[/]"
         )
     sandbox = SandboxManager.from_env(workspace)
+    memory = MemoryStore(workspace)
     tools = [
         ReadFileTool(workspace),
         EditFileTool(workspace),
@@ -166,6 +184,8 @@ def main(argv: list[str] | None = None) -> int:
         FindFilesTool(workspace),
         ListFilesTool(workspace),
         SearchTool(workspace),
+        ReadMemoryTool(memory),
+        RememberTool(memory),
         WebSearchTool(create_search_provider(args.search_provider)),
         FetchUrlTool(timeout=args.request_timeout),
         ShellTool(workspace, sandbox=sandbox),
@@ -188,7 +208,19 @@ def main(argv: list[str] | None = None) -> int:
         max_steps=args.max_steps,
         plan_mode=args.plan,
         permission_mode=initial_permission_mode,
+        memory=memory,
     )
+    session_store = SessionStore(workspace)
+    task = " ".join(args.task).strip()
+    session = _select_session(
+        session_store,
+        resume=args.resume,
+        new_session=args.new_session,
+        interactive=not task,
+    )
+    if session is None:
+        console.print(f"[red]找不到会话：{args.resume}[/]")
+        return 1
     renderer = TerminalRenderer(console, verbose=args.verbose)
     app = TerminalApp(
         runtime,
@@ -198,9 +230,11 @@ def main(argv: list[str] | None = None) -> int:
         workspace=workspace,
         plan_mode=args.plan,
         permission_handler=permission_handler,
+        session_store=session_store,
+        session=session,
+        memory=memory,
     )
 
-    task = " ".join(args.task).strip()
     if task:
         return 0 if app.run_task(task) else 1
     return app.run()
@@ -216,6 +250,19 @@ def configuration_sources(cwd: Path) -> list[Path]:
     sources.append(user_config_path())
     sources.append(user_settings_path())
     return sources
+
+def _select_session(
+    store: SessionStore,
+    *,
+    resume: str | None,
+    new_session: bool,
+    interactive: bool,
+):
+    if new_session:
+        return store.draft()
+    if resume:
+        return store.latest() if resume == "latest" else store.load(resume)
+    return store.draft()
 
 
 def load_configuration(*, cwd: Path | None = None) -> list[Path]:

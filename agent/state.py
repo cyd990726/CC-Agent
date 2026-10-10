@@ -15,6 +15,13 @@ class AgentState:
     finished: bool = False
     final_answer: str | None = None
     steps: int = 0
+    token_usage: dict[str, int] = field(
+        default_factory=lambda: {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+    )
 
     def add_message(self, role: str, content: str) -> None:
         self.messages.append({"role": role, "content": content})

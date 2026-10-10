@@ -34,6 +34,7 @@ def build_system_prompt(
     *,
     plan_mode: bool = False,
     permission_mode: PermissionMode = PermissionMode.ASK,
+    memory_section: str | None = None,
 ) -> str:
     """Render the runtime prompt with the currently registered tools."""
 
@@ -46,6 +47,8 @@ def build_system_prompt(
             "and return a concrete ordered plan. Do not modify files or ask to "
             "execute commands. State assumptions and risks where relevant."
         )
+    if memory_section:
+        prompt += memory_section
     mode_instructions = {
         PermissionMode.ASK: (
             "Ask for approval mode: ask before edits, shell commands, network "

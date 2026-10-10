@@ -9,7 +9,8 @@ from agent.cancellation import CancellationToken, RunCancelled, check_cancelled
 from agent.permissions import PermissionMode
 from agent.prompt import build_system_prompt
 from agent.state import AgentState
-from model.llm import LLM, ModelProtocolError
+from agent.memory import MemoryStore
+from model.llm import LLM, ModelProtocolError, TokenUsage
 from tools.base import ToolExecutor
 
 
@@ -41,6 +42,7 @@ class AgentRuntime:
         plan_mode: bool = False,
         permission_mode: PermissionMode = PermissionMode.ASK,
         protocol_retries: int = 2,
+        memory: MemoryStore | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
@@ -54,6 +56,7 @@ class AgentRuntime:
         self.set_plan_mode(plan_mode)
         self.permission_mode = PermissionMode.ASK
         self.set_permission_mode(permission_mode)
+        self.memory = memory
 
     def set_plan_mode(self, enabled: bool) -> None:
         """Enable read-only planning or restore the full tool set."""
@@ -72,13 +75,18 @@ class AgentRuntime:
         self,
         task: str,
         *,
+        prior_messages: list[dict[str, str]] | None = None,
         on_event: Callable[[AgentEvent], None] | None = None,
         cancellation: CancellationToken | None = None,
     ) -> AgentState:
         token = cancellation or CancellationToken()
         try:
             with token.bind():
-                return self._run(task, on_event=on_event)
+                return self._run(
+                    task,
+                    prior_messages=prior_messages,
+                    on_event=on_event,
+                )
         except RunCancelled:
             self._emit(on_event, EventType.RUN_CANCELLED)
             raise
@@ -87,6 +95,7 @@ class AgentRuntime:
         self,
         task: str,
         *,
+        prior_messages: list[dict[str, str]] | None = None,
         on_event: Callable[[AgentEvent], None] | None = None,
     ) -> AgentState:
         task = task.strip()
@@ -94,14 +103,22 @@ class AgentRuntime:
             raise ValueError("task cannot be empty")
 
         state = AgentState(current_task=task)
+        memory_section = self.memory.prompt_section() if self.memory is not None else None
         state.add_message(
             "system",
             build_system_prompt(
                 self.tools.describe(),
                 plan_mode=self.plan_mode,
                 permission_mode=self.permission_mode,
+                memory_section=memory_section,
             ),
         )
+        if prior_messages:
+            state.messages.extend(
+                dict(message)
+                for message in prior_messages
+                if message.get("role") != "system"
+            )
         state.add_message("user", task)
         self._emit(on_event, EventType.RUN_STARTED, task=task)
         protocol_errors = 0
@@ -114,6 +131,19 @@ class AgentRuntime:
                     EventType.MODEL_STARTED,
                     step=state.steps + 1,
                 )
+                step = state.steps + 1
+                step_usage: TokenUsage | None = None
+
+                def record_usage(usage: TokenUsage) -> None:
+                    nonlocal step_usage
+                    step_usage = usage
+                    self._emit(
+                        on_event,
+                        EventType.MODEL_USAGE,
+                        step=step,
+                        usage=usage.as_dict(),
+                    )
+
                 try:
                     response = self.model.stream_chat_with_tools(
                         state.messages,
@@ -123,9 +153,12 @@ class AgentRuntime:
                             EventType.MODEL_DELTA,
                             delta=delta,
                         ),
+                        on_usage=record_usage,
                     )
                     check_cancelled()
                     state.steps += 1
+                    if step_usage is not None:
+                        self._add_usage(state.token_usage, step_usage.as_dict())
                     response = self._normalize_response(response)
                     self._record_model_response(state, response)
                     self._emit(
@@ -133,9 +166,17 @@ class AgentRuntime:
                         EventType.MODEL_COMPLETED,
                         step=state.steps,
                         response=dict(response),
+                        usage=(
+                            step_usage.as_dict()
+                            if step_usage is not None
+                            else None
+                        ),
+                        total_usage=dict(state.token_usage),
                     )
                 except ModelProtocolError as exc:
                     state.steps += 1
+                    if step_usage is not None:
+                        self._add_usage(state.token_usage, step_usage.as_dict())
                     protocol_errors += 1
                     if protocol_errors > self.protocol_retry_limit:
                         raise AgentRuntimeError(
@@ -147,6 +188,12 @@ class AgentRuntime:
                         EventType.MODEL_COMPLETED,
                         step=state.steps,
                         response={"protocol_error": str(exc)},
+                        usage=(
+                            step_usage.as_dict()
+                            if step_usage is not None
+                            else None
+                        ),
+                        total_usage=dict(state.token_usage),
                     )
                     state.add_message(
                         "user",
@@ -202,6 +249,7 @@ class AgentRuntime:
                         EventType.RUN_COMPLETED,
                         answer=state.final_answer,
                         steps=state.steps,
+                        usage=dict(state.token_usage),
                     )
                     return state
 
@@ -349,6 +397,15 @@ class AgentRuntime:
         except (TypeError, ValueError) as exc:
             raise AgentRuntimeError("model response is not JSON serializable") from exc
         state.add_message("assistant", content)
+
+    @staticmethod
+    def _add_usage(total: dict[str, int], usage: Mapping[str, Any]) -> None:
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            try:
+                value = int(usage.get(key, 0))
+            except (TypeError, ValueError):
+                value = 0
+            total[key] = int(total.get(key, 0)) + max(0, value)
 
     @staticmethod
     def _normalize_response(response: Mapping[str, Any]) -> Mapping[str, Any]:
