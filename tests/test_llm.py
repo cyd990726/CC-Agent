@@ -251,14 +251,14 @@ class ChatCompletionsLLMTests(unittest.TestCase):
             result, {"action": {"tool": "shell", "args": {"command": "ls"}}}
         )
 
-    def test_stream_chat_with_tools_rejects_multiple_tool_calls(self) -> None:
+    def test_stream_chat_with_tools_returns_every_tool_call_in_order(self) -> None:
         response = MagicMock()
         response.__enter__.return_value = response
         response.__iter__.return_value = iter(
             [
                 b'data: {"choices":[{"delta":{"tool_calls":['
-                b'{"index":0,"function":{"name":"a","arguments":"{}"}},'
-                b'{"index":1,"function":{"name":"b","arguments":"{}"}}]}}]}\n',
+                b'{"index":0,"function":{"name":"a","arguments":"{\\"x\\":1}"}},'
+                b'{"index":1,"function":{"name":"b","arguments":"{\\"y\\":2}"}}]}}]}\n',
                 b"data: [DONE]\n",
             ]
         )
@@ -266,14 +266,21 @@ class ChatCompletionsLLMTests(unittest.TestCase):
             model="test-model", base_url="https://example.test/v1"
         )
 
-        with (
-            patch("model.llm.urllib.request.urlopen", return_value=response),
-            self.assertRaisesRegex(ModelProtocolError, "one tool call per step"),
-        ):
-            model.stream_chat_with_tools(
+        with patch("model.llm.urllib.request.urlopen", return_value=response):
+            result = model.stream_chat_with_tools(
                 [{"role": "user", "content": "hello"}],
                 [{"name": "a", "description": "A.", "args": {}}],
             )
+
+        self.assertEqual(
+            result,
+            {
+                "actions": [
+                    {"tool": "a", "args": {"x": 1}},
+                    {"tool": "b", "args": {"y": 2}},
+                ]
+            },
+        )
 
     def test_stream_chat_with_tools_rejects_invalid_argument_json(self) -> None:
         response = MagicMock()

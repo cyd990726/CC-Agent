@@ -64,6 +64,11 @@ class TokenUsage:
 class LLM(ABC):
     """Minimal interface required by the agent runtime."""
 
+    #: True when ``stream_chat_with_tools`` drives the provider's native
+    #: tool-calling interface instead of the text JSON protocol. The runtime
+    #: uses this to pick a prompt that does not teach the JSON envelope.
+    supports_native_tools: bool = False
+
     # 和LLM的子类交互的主要方法是chat方法，它接受一个消息序列，并返回一个动作协议的JSON对象。这个方法是抽象的，必须在子类中实现。
     @abstractmethod
     def chat(self, messages: Sequence[Mapping[str, str]]) -> Mapping[str, Any]:
@@ -108,6 +113,8 @@ class LLM(ABC):
 
 class ChatCompletionsLLM(LLM):
     """Call any provider exposing an OpenAI-compatible chat completions API."""
+
+    supports_native_tools = True
 
     def __init__(
         self,
@@ -289,14 +296,16 @@ class ChatCompletionsLLM(LLM):
         self._open_with_retries(payload, consume)
         if usage is not None and on_usage is not None:
             on_usage(usage)
-        if len(calls) > 1:
-            raise ModelProtocolError(
-                "model returned multiple tool calls; reply with exactly one "
-                "tool call per step",
-                raw=_describe_tool_calls(calls),
-            )
         if calls:
-            return _tool_call_action(calls[min(calls)])
+            actions = [
+                _tool_call_action(calls[index])["action"]
+                for index in sorted(calls)
+            ]
+            if len(actions) == 1:
+                return {"action": actions[0]}
+            # Several independent calls are still one model step; the runtime
+            # executes them in order so no requested work is silently dropped.
+            return {"actions": actions}
         text = "".join(chunks)
         if not text.strip():
             raise ModelProtocolError(

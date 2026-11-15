@@ -1,7 +1,7 @@
 """The minimal model -> action -> observation agent loop."""
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from agent.events import AgentEvent, EventType
@@ -16,6 +16,27 @@ from tools.base import ToolExecutor
 
 MAX_REJECTED_RESPONSE_CHARS = 2_000
 
+FINAL_ANSWER_TOOL_NAME = "final_answer"
+FINAL_ANSWER_TOOL: dict[str, Any] = {
+    "name": FINAL_ANSWER_TOOL_NAME,
+    "description": (
+        "Finish the task and return the concise result for the user. "
+        "Call this only when the task is complete or cannot be completed."
+    ),
+    "args": {
+        "type": "object",
+        "properties": {
+            "answer": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Concise result for the user.",
+            }
+        },
+        "required": ["answer"],
+        "additionalProperties": False,
+    },
+}
+
 
 def _truncate_raw(raw: str) -> str:
     """Keep a rejected response short enough to stay useful in context."""
@@ -24,6 +45,25 @@ def _truncate_raw(raw: str) -> str:
     if len(text) <= MAX_REJECTED_RESPONSE_CHARS:
         return text
     return text[:MAX_REJECTED_RESPONSE_CHARS] + "\n… (truncated)"
+
+
+def _is_final_answer_action(action: Any) -> bool:
+    """Return whether an action is really the model finishing the task."""
+
+    if not isinstance(action, Mapping):
+        return False
+    if action.get("tool") != FINAL_ANSWER_TOOL_NAME:
+        return False
+    args = action.get("args", {})
+    return isinstance(args, Mapping) and (
+        args.get("answer") is not None or args.get("final_answer") is not None
+    )
+
+
+def _final_answer_response(action: Mapping[str, Any]) -> dict[str, Any]:
+    args = action.get("args", {})
+    answer = args.get("answer", args.get("final_answer"))
+    return {"final_answer": answer}
 
 
 # 智能体运行时错误的基类
@@ -116,13 +156,15 @@ class AgentRuntime:
 
         state = AgentState(current_task=task)
         memory_section = self.memory.prompt_section() if self.memory is not None else None
+        tool_descriptions = self._model_tool_descriptions()
         state.add_message(
             "system",
             build_system_prompt(
-                self.tools.describe(),
+                tool_descriptions,
                 plan_mode=self.plan_mode,
                 permission_mode=self.permission_mode,
                 memory_section=memory_section,
+                native_tools=self.model.supports_native_tools,
             ),
         )
         if prior_messages:
@@ -159,7 +201,7 @@ class AgentRuntime:
                 try:
                     response = self.model.stream_chat_with_tools(
                         state.messages,
-                        self.tools.describe(),
+                        tool_descriptions,
                         on_delta=lambda delta: self._emit(
                             on_event,
                             EventType.MODEL_DELTA,
@@ -217,6 +259,15 @@ class AgentRuntime:
                         ),
                     )
                     self._emit_protocol_error(on_event, str(exc))
+                    continue
+
+                if "actions" in response:
+                    finished = self._execute_actions(
+                        state, on_event, response["actions"]
+                    )
+                    protocol_errors = 0
+                    if finished:
+                        return state
                     continue
 
                 has_action = "action" in response and response["action"] is not None
@@ -281,34 +332,7 @@ class AgentRuntime:
                         f"after {self.protocol_retry_limit} retries: {exc}"
                     ) from exc
                 protocol_errors = 0
-                event_args = dict(args)
-                self._emit(
-                    on_event,
-                    EventType.TOOL_REQUESTED,
-                    tool=tool_name,
-                    args=event_args,
-                )
-                self._emit(
-                    on_event,
-                    EventType.TOOL_STARTED,
-                    tool=tool_name,
-                    args=event_args,
-                )
-                result = self.tools.execute(tool_name, args)
-                check_cancelled()
-                state.tool_results.append(result)
-                self._emit(
-                    on_event,
-                    EventType.TOOL_COMPLETED,
-                    result=result.as_dict(),
-                )
-                state.add_message(
-                    "user",
-                    "Observation:\n"
-                    + json.dumps(
-                        result.as_dict(), ensure_ascii=False, sort_keys=True
-                    ),
-                )
+                self._run_action(state, on_event, tool_name, args)
 
             raise MaxStepsExceeded(state)
         except RunCancelled:
@@ -321,6 +345,75 @@ class AgentRuntime:
             )
             raise
 
+    def _execute_actions(
+        self,
+        state: AgentState,
+        on_event: Callable[[AgentEvent], None] | None,
+        actions: Any,
+    ) -> bool:
+        """Run every requested call in order, appending one observation each.
+
+        Returns True when one of the calls finished the task, so the caller
+        stops stepping.
+        """
+
+        if not isinstance(actions, Sequence) or isinstance(actions, (str, bytes)):
+            raise AgentRuntimeError("model actions must be a list")
+        for action in actions:
+            if _is_final_answer_action(action):
+                answer = _final_answer_response(action)["final_answer"]
+                if not isinstance(answer, str) or not answer.strip():
+                    raise AgentRuntimeError(
+                        "final_answer must be a non-empty string"
+                    )
+                state.finished = True
+                state.final_answer = answer.strip()
+                self._emit(
+                    on_event,
+                    EventType.RUN_COMPLETED,
+                    answer=state.final_answer,
+                    steps=state.steps,
+                    usage=dict(state.token_usage),
+                )
+                return True
+            tool_name, args = self._parse_action(action)
+            self._run_action(state, on_event, tool_name, args)
+        return False
+
+    def _run_action(
+        self,
+        state: AgentState,
+        on_event: Callable[[AgentEvent], None] | None,
+        tool_name: str,
+        args: Mapping[str, Any],
+    ) -> None:
+        event_args = dict(args)
+        self._emit(
+            on_event,
+            EventType.TOOL_REQUESTED,
+            tool=tool_name,
+            args=event_args,
+        )
+        self._emit(
+            on_event,
+            EventType.TOOL_STARTED,
+            tool=tool_name,
+            args=event_args,
+        )
+        result = self.tools.execute(tool_name, args)
+        check_cancelled()
+        state.tool_results.append(result)
+        self._emit(
+            on_event,
+            EventType.TOOL_COMPLETED,
+            result=result.as_dict(),
+        )
+        state.add_message(
+            "user",
+            "Observation:\n"
+            + json.dumps(result.as_dict(), ensure_ascii=False, sort_keys=True),
+        )
+
     @staticmethod
     def _emit(
         handler: Callable[[AgentEvent], None] | None,
@@ -329,6 +422,21 @@ class AgentRuntime:
     ) -> None:
         if handler is not None:
             handler(AgentEvent(event_type, data))
+
+    def _model_tool_descriptions(self) -> list[dict[str, Any]]:
+        """Return the tool descriptions the model sees.
+
+        Native tool calling needs a structured way to finish, so ``final_answer``
+        is offered as a tool. The text protocol already reserves that key for
+        the same purpose and must not expose it as a callable tool.
+        """
+
+        descriptions = self.tools.describe()
+        if not self.model.supports_native_tools:
+            return descriptions
+        if any(item.get("name") == FINAL_ANSWER_TOOL_NAME for item in descriptions):
+            return descriptions
+        return [*descriptions, dict(FINAL_ANSWER_TOOL)]
 
     def _record_protocol_error(
         self,
@@ -424,22 +532,17 @@ class AgentRuntime:
     def _normalize_response(response: Mapping[str, Any]) -> Mapping[str, Any]:
         """Accept common final-answer variants without treating them as tools."""
 
-        action = response.get("action")
-        if not isinstance(action, Mapping):
+        actions = response.get("actions")
+        if isinstance(actions, Sequence) and not isinstance(actions, (str, bytes)):
+            # Keep the batch intact: earlier calls may have side effects that
+            # must not be dropped just because the model also answered.
+            if len(actions) == 1:
+                return {"action": actions[0]}
+            return {"actions": list(actions)}
+
+        if not _is_final_answer_action(response.get("action")):
             return response
-        tool_name = action.get("tool")
-        if tool_name != "final_answer":
-            return response
-        args = action.get("args", {})
-        if not isinstance(args, Mapping):
-            return response
-        answer = args.get("answer", args.get("final_answer"))
-        if answer is None:
-            return response
-        normalized = dict(response)
-        normalized.pop("action", None)
-        normalized["final_answer"] = answer
-        return normalized
+        return _final_answer_response(response["action"])
 
     @staticmethod
     def _parse_action(action: Any) -> tuple[str, Mapping[str, Any]]:
