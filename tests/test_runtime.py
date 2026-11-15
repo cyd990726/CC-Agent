@@ -236,6 +236,32 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(payload["success"])
         self.assertIn("1 protocol retries remaining", payload["output"])
 
+    def test_protocol_error_observation_includes_rejected_response(self) -> None:
+        class RawProtocolErrorLLM(QueueLLM):
+            def __init__(self, responses) -> None:
+                super().__init__(responses)
+                self.failures_remaining = 1
+
+            def stream_chat(self, messages, on_delta=None, on_usage=None):
+                self.calls.append(list(messages))
+                if self.failures_remaining:
+                    self.failures_remaining -= 1
+                    raise ModelProtocolError(
+                        "model did not return valid JSON",
+                        raw='{"action":{"tool":"shell","args":',
+                    )
+                return next(self.responses)
+
+        model = RawProtocolErrorLLM([{"final_answer": "recovered"}])
+
+        AgentRuntime(model, ToolExecutor([])).run("test task")
+
+        observation = model.calls[1][-1]["content"]
+        payload = json.loads(observation.split("\n", 1)[1])
+        self.assertEqual(
+            payload["rejected_response"], '{"action":{"tool":"shell","args":'
+        )
+
     def test_invalid_action_shape_can_be_retried(self) -> None:
         model = QueueLLM(
             [

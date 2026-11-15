@@ -4,7 +4,13 @@ import unittest
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
-from model.llm import ChatCompletionsLLM, ModelError, TokenUsage, parse_json_object
+from model.llm import (
+    ChatCompletionsLLM,
+    ModelError,
+    ModelProtocolError,
+    TokenUsage,
+    parse_json_object,
+)
 
 
 class ParseModelResponseTests(unittest.TestCase):
@@ -22,6 +28,72 @@ class ParseModelResponseTests(unittest.TestCase):
     def test_rejects_non_object_json(self) -> None:
         with self.assertRaises(ModelError):
             parse_json_object("[]")
+
+    def test_rejects_multiple_action_objects(self) -> None:
+        content = (
+            '{"thought":"first","action":{"tool":"x","args":{}}}\n\n'
+            '{"thought":"second","action":{"tool":"y","args":{}}}'
+        )
+
+        with self.assertRaisesRegex(ModelError, "multiple JSON action objects"):
+            parse_json_object(content)
+
+    def test_parses_object_with_surrounding_prose(self) -> None:
+        content = (
+            "Here is the next step:\n\n"
+            '{"final_answer":"ok"}\n\n'
+            "Let me wait for the observation."
+        )
+
+        self.assertEqual(parse_json_object(content), {"final_answer": "ok"})
+
+    def test_parses_object_inside_fence_with_prose(self) -> None:
+        content = (
+            "Sure, I will inspect the files.\n"
+            '```json\n{"action":{"tool":"list_files","args":{}}}\n```\n'
+            "Waiting for the result."
+        )
+
+        self.assertEqual(
+            parse_json_object(content),
+            {"action": {"tool": "list_files", "args": {}}},
+        )
+
+    def test_rejects_content_without_json_object(self) -> None:
+        with self.assertRaisesRegex(ModelError, "did not return valid JSON"):
+            parse_json_object("I cannot use tools right now.")
+
+    def test_skips_embedded_objects_that_are_not_actions(self) -> None:
+        content = (
+            'For example {"thought":"demo"} is not a step. '
+            'The real step is {"final_answer":"ok"}.'
+        )
+
+        self.assertEqual(parse_json_object(content), {"final_answer": "ok"})
+
+    def test_rejects_prose_example_next_to_a_real_action(self) -> None:
+        content = (
+            'You could call {"action":{"tool":"shell","args":{"command":"rm -rf build"}}}.\n'
+            'My actual next step:\n'
+            '{"action":{"tool":"read_file","args":{"path":"main.py"}}}'
+        )
+
+        with self.assertRaisesRegex(ModelError, "multiple JSON action objects"):
+            parse_json_object(content)
+
+    def test_rejects_truncated_action_inside_larger_object(self) -> None:
+        content = '{"thought":"reading","action":{"tool":"read_file","args":{"path":"main.py"}'
+
+        with self.assertRaisesRegex(ModelError, "did not return valid JSON"):
+            parse_json_object(content)
+
+    def test_protocol_error_carries_raw_response_for_retry(self) -> None:
+        content = '{"thought":"reading","action":{"tool":"read_file","args":'
+
+        with self.assertRaises(ModelProtocolError) as caught:
+            parse_json_object(content)
+
+        self.assertEqual(caught.exception.raw, content)
 
 
 class ChatCompletionsLLMTests(unittest.TestCase):
@@ -95,6 +167,223 @@ class ChatCompletionsLLMTests(unittest.TestCase):
         self.assertEqual(payload["stream_options"], {"include_usage": True})
         self.assertEqual(deltas, ['{"final_', 'answer":"ok"}'])
         self.assertEqual(result, {"final_answer": "ok"})
+        self.assertEqual(
+            usages,
+            [TokenUsage(prompt_tokens=5, completion_tokens=4, total_tokens=9)],
+        )
+
+    def test_stream_chat_with_tools_sends_openai_tool_schema(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__iter__.return_value = iter(
+            [
+                b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                b'"id":"call_1","type":"function","function":'
+                b'{"name":"echo","arguments":"{\\"text\\":\\"hi\\"}"}}]},'
+                b'"finish_reason":"tool_calls"}]}\n',
+                b"data: [DONE]\n",
+            ]
+        )
+        model = ChatCompletionsLLM(
+            model="test-model", base_url="https://example.test/v1"
+        )
+        tools = [
+            {
+                "name": "echo",
+                "description": "Echo text.",
+                "args": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+            }
+        ]
+
+        with patch("model.llm.urllib.request.urlopen", return_value=response) as call:
+            model.stream_chat_with_tools(
+                [{"role": "user", "content": "hello"}], tools
+            )
+
+        payload = json.loads(call.call_args.args[0].data)
+        self.assertEqual(
+            payload["tools"],
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "echo",
+                        "description": "Echo text.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"],
+                        },
+                    },
+                }
+            ],
+        )
+
+    def test_stream_chat_with_tools_accumulates_fragmented_arguments(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__iter__.return_value = iter(
+            [
+                b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                b'"function":{"name":"sh"}}]}}]}\n',
+                b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                b'"function":{"name":"ell","arguments":"{\\"comm"}}]}}]}\n',
+                b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                b'"function":{"arguments":"and\\":\\"ls\\"}"}}]}}]}\n',
+                b"data: [DONE]\n",
+            ]
+        )
+        model = ChatCompletionsLLM(
+            model="test-model", base_url="https://example.test/v1"
+        )
+
+        with patch("model.llm.urllib.request.urlopen", return_value=response):
+            result = model.stream_chat_with_tools(
+                [{"role": "user", "content": "hello"}],
+                [{"name": "shell", "description": "Run.", "args": {}}],
+            )
+
+        self.assertEqual(
+            result, {"action": {"tool": "shell", "args": {"command": "ls"}}}
+        )
+
+    def test_stream_chat_with_tools_rejects_multiple_tool_calls(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__iter__.return_value = iter(
+            [
+                b'data: {"choices":[{"delta":{"tool_calls":['
+                b'{"index":0,"function":{"name":"a","arguments":"{}"}},'
+                b'{"index":1,"function":{"name":"b","arguments":"{}"}}]}}]}\n',
+                b"data: [DONE]\n",
+            ]
+        )
+        model = ChatCompletionsLLM(
+            model="test-model", base_url="https://example.test/v1"
+        )
+
+        with (
+            patch("model.llm.urllib.request.urlopen", return_value=response),
+            self.assertRaisesRegex(ModelProtocolError, "one tool call per step"),
+        ):
+            model.stream_chat_with_tools(
+                [{"role": "user", "content": "hello"}],
+                [{"name": "a", "description": "A.", "args": {}}],
+            )
+
+    def test_stream_chat_with_tools_rejects_invalid_argument_json(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__iter__.return_value = iter(
+            [
+                b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                b'"function":{"name":"shell","arguments":"{\\"command\\":"}}]}}]}\n',
+                b"data: [DONE]\n",
+            ]
+        )
+        model = ChatCompletionsLLM(
+            model="test-model", base_url="https://example.test/v1"
+        )
+
+        with (
+            patch("model.llm.urllib.request.urlopen", return_value=response),
+            self.assertRaisesRegex(ModelProtocolError, "not valid JSON"),
+        ):
+            model.stream_chat_with_tools(
+                [{"role": "user", "content": "hello"}],
+                [{"name": "shell", "description": "Run.", "args": {}}],
+            )
+
+    def test_stream_chat_with_tools_rejects_non_object_arguments(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__iter__.return_value = iter(
+            [
+                b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                b'"function":{"name":"shell","arguments":"[]"}}]}}]}\n',
+                b"data: [DONE]\n",
+            ]
+        )
+        model = ChatCompletionsLLM(
+            model="test-model", base_url="https://example.test/v1"
+        )
+
+        with (
+            patch("model.llm.urllib.request.urlopen", return_value=response),
+            self.assertRaisesRegex(ModelProtocolError, "must be an object"),
+        ):
+            model.stream_chat_with_tools(
+                [{"role": "user", "content": "hello"}],
+                [{"name": "shell", "description": "Run.", "args": {}}],
+            )
+
+    def test_stream_chat_with_tools_falls_back_to_text_protocol(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__iter__.return_value = iter(
+            [
+                b'data: {"choices":[{"delta":{"content":"{\\"final_ans"}}]}\n',
+                b'data: {"choices":[{"delta":{"content":"wer\\":\\"done\\"}"}}]}\n',
+                b"data: [DONE]\n",
+            ]
+        )
+        model = ChatCompletionsLLM(
+            model="test-model", base_url="https://example.test/v1"
+        )
+
+        with patch("model.llm.urllib.request.urlopen", return_value=response):
+            result = model.stream_chat_with_tools(
+                [{"role": "user", "content": "hello"}],
+                [{"name": "shell", "description": "Run.", "args": {}}],
+            )
+
+        self.assertEqual(result, {"final_answer": "done"})
+
+    def test_stream_chat_with_tools_rejects_empty_response(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__iter__.return_value = iter([b"data: [DONE]\n"])
+        model = ChatCompletionsLLM(
+            model="test-model", base_url="https://example.test/v1"
+        )
+
+        with (
+            patch("model.llm.urllib.request.urlopen", return_value=response),
+            self.assertRaisesRegex(ModelProtocolError, "neither a tool call"),
+        ):
+            model.stream_chat_with_tools(
+                [{"role": "user", "content": "hello"}],
+                [{"name": "shell", "description": "Run.", "args": {}}],
+            )
+
+    def test_stream_chat_with_tools_reports_usage(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__iter__.return_value = iter(
+            [
+                b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                b'"function":{"name":"shell","arguments":"{}"}}]}}]}\n',
+                b'data: {"choices":[],"usage":{"prompt_tokens":5,'
+                b'"completion_tokens":4,"total_tokens":9}}\n',
+                b"data: [DONE]\n",
+            ]
+        )
+        model = ChatCompletionsLLM(
+            model="test-model", base_url="https://example.test/v1"
+        )
+        usages: list[TokenUsage] = []
+
+        with patch("model.llm.urllib.request.urlopen", return_value=response):
+            model.stream_chat_with_tools(
+                [{"role": "user", "content": "hello"}],
+                [{"name": "shell", "description": "Run.", "args": {}}],
+                on_usage=usages.append,
+            )
+
         self.assertEqual(
             usages,
             [TokenUsage(prompt_tokens=5, completion_tokens=4, total_tokens=9)],

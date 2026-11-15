@@ -14,6 +14,18 @@ from model.llm import LLM, ModelProtocolError, TokenUsage
 from tools.base import ToolExecutor
 
 
+MAX_REJECTED_RESPONSE_CHARS = 2_000
+
+
+def _truncate_raw(raw: str) -> str:
+    """Keep a rejected response short enough to stay useful in context."""
+
+    text = raw.strip()
+    if len(text) <= MAX_REJECTED_RESPONSE_CHARS:
+        return text
+    return text[:MAX_REJECTED_RESPONSE_CHARS] + "\n… (truncated)"
+
+
 # 智能体运行时错误的基类
 class AgentRuntimeError(RuntimeError):
     """Raised when the model violates the runtime protocol."""
@@ -368,22 +380,23 @@ class AgentRuntime:
         *,
         attempts_remaining: int,
     ) -> str:
-        return (
-            "Observation:\n"
-            + json.dumps(
-                {
-                    "tool": "model_protocol",
-                    "args": {},
-                    "success": False,
-                    "output": (
-                        f"{error}. Reply with exactly one JSON object matching "
-                        "the action protocol. "
-                        f"{attempts_remaining} protocol retries remaining."
-                    ),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            )
+        payload: dict[str, Any] = {
+            "tool": "model_protocol",
+            "args": {},
+            "success": False,
+            "output": (
+                f"{error}. Reply with exactly one JSON object matching "
+                "the action protocol. "
+                f"{attempts_remaining} protocol retries remaining."
+            ),
+        }
+        raw = getattr(error, "raw", None)
+        if isinstance(raw, str) and raw.strip():
+            # Showing the rejected output lets the model correct the exact
+            # mistake instead of repeating it blind.
+            payload["rejected_response"] = _truncate_raw(raw)
+        return "Observation:\n" + json.dumps(
+            payload, ensure_ascii=False, sort_keys=True
         )
 
     @staticmethod
