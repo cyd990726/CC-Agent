@@ -3,6 +3,7 @@ import threading
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -23,7 +24,12 @@ from tools.base import ToolResult
 from ui.logo import LOGO_LINES, render_logo
 from ui.permissions import SessionPermissionHandler
 from ui.renderer import TerminalRenderer
-from ui.terminal import COMMANDS, SlashCommandCompleter, TerminalApp
+from ui.terminal import (
+    COMMANDS,
+    SlashCommandCompleter,
+    TerminalApp,
+    format_relative_time,
+)
 
 
 class SlashCommandCompleterTests(unittest.TestCase):
@@ -52,6 +58,35 @@ class SlashCommandCompleterTests(unittest.TestCase):
         )
 
         self.assertEqual(completions, [])
+
+
+class RelativeTimeTests(unittest.TestCase):
+    def test_formats_session_timestamps_relative_to_now(self) -> None:
+        now = datetime(2026, 11, 15, 12, 0, tzinfo=timezone.utc)
+
+        def ago(delta: timedelta) -> str:
+            return (now - delta).isoformat()
+
+        self.assertEqual(format_relative_time(ago(timedelta(seconds=30)), now=now), "刚刚")
+        self.assertEqual(format_relative_time(ago(timedelta(minutes=5)), now=now), "5 分钟前")
+        self.assertEqual(format_relative_time(ago(timedelta(hours=3)), now=now), "3 小时前")
+        self.assertEqual(format_relative_time(ago(timedelta(days=1)), now=now), "昨天")
+        self.assertEqual(format_relative_time(ago(timedelta(days=3)), now=now), "3 天前")
+        self.assertEqual(
+            format_relative_time(
+                ago(timedelta(days=6, hours=23)),
+                now=now,
+            ),
+            "6 天前",
+        )
+        self.assertRegex(
+            format_relative_time(ago(timedelta(days=30)), now=now),
+            r"^\d{4}-\d{2}-\d{2}$",
+        )
+
+    def test_invalid_timestamp_is_reported_as_unknown(self) -> None:
+        self.assertEqual(format_relative_time(""), "未知")
+        self.assertEqual(format_relative_time("not-a-timestamp"), "未知")
 
 
 class TerminalAppTests(unittest.TestCase):
@@ -570,6 +605,68 @@ class TerminalAppTests(unittest.TestCase):
         self.assertEqual(saved.turns[0]["answer"], "done")
         self.assertEqual(saved.turns[0]["tools"][0]["tool"], "read_file")
 
+    def test_streaming_answer_is_not_duplicated_when_blocks_are_enabled(self) -> None:
+        answer = "你好呀！👋\n\n我是你的编程小助手。"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            store = SessionStore(workspace, root=root / "data")
+            session = store.draft()
+            console = Console(file=StringIO(), force_terminal=False, width=80)
+            renderer = TerminalRenderer(console)
+            runtime = Mock(spec=AgentRuntime)
+
+            def run(task, *, prior_messages, on_event, cancellation):
+                on_event(AgentEvent(EventType.RUN_STARTED, {"task": task}))
+                on_event(AgentEvent(EventType.MODEL_STARTED, {"step": 1}))
+                on_event(
+                    AgentEvent(
+                        EventType.MODEL_DELTA,
+                        {
+                            "delta": json.dumps(
+                                {"final_answer": answer},
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                        },
+                    )
+                )
+                on_event(
+                    AgentEvent(
+                        EventType.RUN_COMPLETED,
+                        {"answer": answer, "steps": 1},
+                    )
+                )
+                state = AgentState(current_task=task)
+                state.final_answer = answer
+                state.finished = True
+                return state
+
+            runtime.run.side_effect = run
+            app = TerminalApp(
+                runtime,
+                renderer,
+                console,
+                model_name="test-model",
+                workspace=workspace,
+                session_store=store,
+                session=session,
+            )
+            self._attach_renderer(app, renderer)
+            renderer.set_stream_render_handler(
+                app._update_streaming_renderables
+            )
+            turn_index = app._record_task_submission("你好呀")
+
+            self.assertTrue(
+                app.run_task("你好呀", checkpoint_turn_index=turn_index)
+            )
+            rendered = self._transcript_text(app)
+
+        self.assertEqual(rendered.count("你好呀！"), 1)
+        self.assertEqual(rendered.count("我是你的编程小助手"), 1)
+
     def test_exit_before_first_task_does_not_persist_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1046,6 +1143,39 @@ class TerminalAppTests(unittest.TestCase):
         self.assertIn("status: running", self._transcript_text(app))
         self.assertIn("running search", self._transcript_text(app))
         self.assertIn("last read_file ok", self._transcript_text(app))
+
+    def test_resume_selector_shows_relative_activity_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            store = SessionStore(workspace, root=root / "data")
+            console = Console(file=StringIO(), force_terminal=False)
+            app = TerminalApp(
+                Mock(spec=AgentRuntime),
+                TerminalRenderer(console),
+                console,
+                model_name="test-model",
+                workspace=workspace,
+                session_store=store,
+            )
+            now = datetime.now(timezone.utc)
+            recent = SessionRecord.new(workspace, title="Recent")
+            recent.tasks = ["recent task"]
+            recent.updated_at = (now - timedelta(hours=3)).isoformat()
+            older = SessionRecord.new(workspace, title="Older")
+            older.tasks = ["older task"]
+            older.updated_at = (now - timedelta(days=3)).isoformat()
+            app._resume_candidates = [recent, older]
+
+            rendered = "".join(
+                fragment[1] for fragment in app._resume_fragments()
+            )
+
+        self.assertIn("3 小时前", rendered)
+        self.assertIn("3 天前", rendered)
+        self.assertIn("Recent", rendered)
+        self.assertIn("Older", rendered)
 
     def test_unified_application_accepts_input_while_worker_runs(self) -> None:
         output = StringIO()
@@ -1573,6 +1703,62 @@ class RendererTests(unittest.TestCase):
             "剩下的 CI 自动完成",
         ):
             self.assertEqual(rendered.count(text), 1, text)
+
+    def test_completion_does_not_publish_preview_when_answer_blocks_are_enabled(self) -> None:
+        renderer = TerminalRenderer(
+            Console(file=StringIO(), force_terminal=False)
+        )
+        blocks: dict[str, object] = {}
+        previews: list[bool] = []
+        renderer.set_block_handler(
+            lambda block_id, objects, expanded, options: blocks.__setitem__(
+                block_id, options
+            )
+        )
+        renderer.set_stream_render_handler(
+            lambda objects, options, final: previews.append(final)
+        )
+
+        self._start_model(renderer)
+        renderer(
+            AgentEvent(
+                EventType.MODEL_DELTA,
+                {"delta": '{"final_answer":"第一段\\n\\n第二段"}'},
+            )
+        )
+        renderer(
+            AgentEvent(
+                EventType.RUN_COMPLETED,
+                {"answer": "第一段\n\n第二段", "steps": 1},
+            )
+        )
+
+        self.assertEqual(previews, [])
+        self.assertEqual(
+            len([key for key in blocks if key.startswith("answer:")]),
+            1,
+        )
+
+    def test_failure_does_not_publish_preview_when_answer_blocks_are_enabled(self) -> None:
+        renderer = TerminalRenderer(
+            Console(file=StringIO(), force_terminal=False)
+        )
+        previews: list[bool] = []
+        renderer.set_block_handler(lambda *args: None)
+        renderer.set_stream_render_handler(
+            lambda objects, options, final: previews.append(final)
+        )
+
+        self._start_model(renderer)
+        renderer(
+            AgentEvent(
+                EventType.MODEL_DELTA,
+                {"delta": '{"final_answer":"第一段\\n\\n"}'},
+            )
+        )
+        renderer(AgentEvent(EventType.RUN_FAILED, {"error": "boom"}))
+
+        self.assertEqual(previews, [])
 
     def test_streaming_markdown_does_not_split_fenced_code(self) -> None:
         stable = TerminalRenderer._stable_streaming_text
