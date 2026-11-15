@@ -236,6 +236,110 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(payload["success"])
         self.assertIn("1 protocol retries remaining", payload["output"])
 
+    def test_protocol_error_observation_includes_rejected_response(self) -> None:
+        class RawProtocolErrorLLM(QueueLLM):
+            def __init__(self, responses) -> None:
+                super().__init__(responses)
+                self.failures_remaining = 1
+
+            def stream_chat(self, messages, on_delta=None, on_usage=None):
+                self.calls.append(list(messages))
+                if self.failures_remaining:
+                    self.failures_remaining -= 1
+                    raise ModelProtocolError(
+                        "model did not return valid JSON",
+                        raw='{"action":{"tool":"shell","args":',
+                    )
+                return next(self.responses)
+
+        model = RawProtocolErrorLLM([{"final_answer": "recovered"}])
+
+        AgentRuntime(model, ToolExecutor([])).run("test task")
+
+        observation = model.calls[1][-1]["content"]
+        payload = json.loads(observation.split("\n", 1)[1])
+        self.assertEqual(
+            payload["rejected_response"], '{"action":{"tool":"shell","args":'
+        )
+
+    def test_multiple_actions_execute_in_order(self) -> None:
+        model = QueueLLM(
+            [
+                {
+                    "actions": [
+                        {"tool": "echo", "args": {"text": "first"}},
+                        {"tool": "echo", "args": {"text": "second"}},
+                    ]
+                },
+                {"final_answer": "done"},
+            ]
+        )
+        state = AgentRuntime(model, ToolExecutor([EchoTool()])).run("test task")
+
+        self.assertEqual(
+            [result.output for result in state.tool_results], ["first", "second"]
+        )
+        observations = [
+            json.loads(message["content"].split("\n", 1)[1])
+            for message in model.calls[1]
+            if message["role"] == "user"
+            and message["content"].startswith("Observation:")
+        ]
+        self.assertEqual(
+            [item["args"]["text"] for item in observations], ["first", "second"]
+        )
+
+    def test_final_answer_inside_multiple_actions_ends_the_run(self) -> None:
+        model = QueueLLM(
+            [
+                {
+                    "actions": [
+                        {"tool": "echo", "args": {"text": "first"}},
+                        {"tool": "final_answer", "args": {"answer": "done"}},
+                    ]
+                }
+            ]
+        )
+        state = AgentRuntime(model, ToolExecutor([EchoTool()])).run("test task")
+
+        self.assertTrue(state.finished)
+        self.assertEqual(state.final_answer, "done")
+        self.assertEqual([result.output for result in state.tool_results], ["first"])
+
+    def test_native_adapter_gets_native_prompt_and_final_answer_tool(self) -> None:
+        class NativeQueueLLM(QueueLLM):
+            supports_native_tools = True
+
+            def __init__(self, responses):
+                super().__init__(responses)
+                self.tools: list[Mapping[str, Any]] = []
+
+            def stream_chat_with_tools(
+                self, messages, tools, on_delta=None, on_usage=None
+            ):
+                self.tools = list(tools)
+                return self.stream_chat(messages)
+
+        model = NativeQueueLLM([{"final_answer": "done"}])
+
+        AgentRuntime(model, ToolExecutor([EchoTool()])).run("test task")
+
+        self.assertEqual(
+            [tool["name"] for tool in model.tools], ["echo", "final_answer"]
+        )
+        system_prompt = model.calls[0][0]["content"]
+        self.assertIn("top-level", system_prompt)
+        self.assertNotIn('{"thought"', system_prompt)
+
+    def test_text_adapter_keeps_json_prompt_without_final_answer_tool(self) -> None:
+        model = ToolAwareQueueLLM([{"final_answer": "done"}])
+
+        AgentRuntime(model, ToolExecutor([EchoTool()])).run("test task")
+
+        self.assertEqual([tool["name"] for tool in model.tools], ["echo"])
+        system_prompt = model.calls[0][0]["content"]
+        self.assertIn('{"thought":"brief status","action":', system_prompt)
+
     def test_invalid_action_shape_can_be_retried(self) -> None:
         model = QueueLLM(
             [

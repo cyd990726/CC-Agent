@@ -22,6 +22,10 @@ class ModelError(RuntimeError):
 class ModelProtocolError(ModelError):
     """Raised when model content does not follow the agent JSON protocol."""
 
+    def __init__(self, message: str, *, raw: str | None = None) -> None:
+        super().__init__(message)
+        self.raw = raw
+
 
 @dataclass(frozen=True)
 class TokenUsage:
@@ -59,6 +63,11 @@ class TokenUsage:
 # 抽象基类
 class LLM(ABC):
     """Minimal interface required by the agent runtime."""
+
+    #: True when ``stream_chat_with_tools`` drives the provider's native
+    #: tool-calling interface instead of the text JSON protocol. The runtime
+    #: uses this to pick a prompt that does not teach the JSON envelope.
+    supports_native_tools: bool = False
 
     # 和LLM的子类交互的主要方法是chat方法，它接受一个消息序列，并返回一个动作协议的JSON对象。这个方法是抽象的，必须在子类中实现。
     @abstractmethod
@@ -104,6 +113,8 @@ class LLM(ABC):
 
 class ChatCompletionsLLM(LLM):
     """Call any provider exposing an OpenAI-compatible chat completions API."""
+
+    supports_native_tools = True
 
     def __init__(
         self,
@@ -159,20 +170,63 @@ class ChatCompletionsLLM(LLM):
     ) -> Mapping[str, Any]:
         """Consume an OpenAI-compatible SSE stream and return its full JSON."""
 
+        return self._run_streaming(
+            lambda deliver, deliver_usage: self._stream_chat(
+                messages, deliver, deliver_usage
+            ),
+            on_delta,
+            on_usage,
+        )
+
+    def stream_chat_with_tools(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        tools: Sequence[Mapping[str, Any]],
+        on_delta: Callable[[str], None] | None = None,
+        on_usage: Callable[[TokenUsage], None] | None = None,
+    ) -> Mapping[str, Any]:
+        """Use native tool calling and normalize one call to the action protocol.
+
+        Providers that support OpenAI-style ``tools`` return structured calls
+        instead of the text JSON protocol, which avoids truncated or malformed
+        JSON. A response without any tool call still falls back to the text
+        protocol so providers that ignore ``tools`` keep working.
+        """
+
+        return self._run_streaming(
+            lambda deliver, deliver_usage: self._stream_chat_with_tools(
+                messages, tools, deliver, deliver_usage
+            ),
+            on_delta,
+            on_usage,
+        )
+
+    def _run_streaming(
+        self,
+        operation: Callable[
+            [
+                Callable[[str], None] | None,
+                Callable[[TokenUsage], None] | None,
+            ],
+            Mapping[str, Any],
+        ],
+        on_delta: Callable[[str], None] | None,
+        on_usage: Callable[[TokenUsage], None] | None,
+    ) -> Mapping[str, Any]:
+        """Run a streaming request so cancellation behaves the same everywhere."""
+
         token = current_token.get()
-        if token is not None:
-            deliver = (
-                (lambda delta: token.deliver(on_delta, delta))
-                if on_delta is not None else None
-            )
-            deliver_usage = (
-                (lambda usage: token.deliver(on_usage, usage))
-                if on_usage is not None else None
-            )
-            return token.run_io(
-                lambda: self._stream_chat(messages, deliver, deliver_usage)
-            )
-        return self._stream_chat(messages, on_delta, on_usage)
+        if token is None:
+            return operation(on_delta, on_usage)
+        deliver = (
+            (lambda delta: token.deliver(on_delta, delta))
+            if on_delta is not None else None
+        )
+        deliver_usage = (
+            (lambda usage: token.deliver(on_usage, usage))
+            if on_usage is not None else None
+        )
+        return token.run_io(lambda: operation(deliver, deliver_usage))
 
     def _stream_chat(self, messages, on_delta=None, on_usage=None):
 
@@ -182,18 +236,7 @@ class ChatCompletionsLLM(LLM):
 
         def consume(response: Any) -> None:
             nonlocal usage
-            for raw_line in response:
-                check_cancelled()
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line or line.startswith(":") or not line.startswith("data:"):
-                    continue
-                data_text = line.removeprefix("data:").strip()
-                if data_text == "[DONE]":
-                    break
-                try:
-                    event = json.loads(data_text)
-                except json.JSONDecodeError as exc:
-                    raise ModelError("model API returned an invalid stream event") from exc
+            for event in self._iter_stream_events(response):
                 event_usage = TokenUsage.from_api(event.get("usage"))
                 if event_usage is not None:
                     usage = event_usage
@@ -214,13 +257,84 @@ class ChatCompletionsLLM(LLM):
 
         self._open_with_retries(payload, consume)
         if not chunks:
-            raise ModelError("model API returned an empty stream")
+            raise ModelProtocolError("model API returned an empty stream", raw="")
         if usage is not None and on_usage is not None:
             on_usage(usage)
         return parse_json_object("".join(chunks))
 
+    def _stream_chat_with_tools(
+        self, messages, tools, on_delta=None, on_usage=None
+    ) -> Mapping[str, Any]:
+
+        payload = self._make_payload(messages, stream=True, tools=tools)
+        chunks: list[str] = []
+        calls: dict[int, dict[str, str]] = {}
+        usage: TokenUsage | None = None
+
+        def consume(response: Any) -> None:
+            nonlocal usage
+            for event in self._iter_stream_events(response):
+                event_usage = TokenUsage.from_api(event.get("usage"))
+                if event_usage is not None:
+                    usage = event_usage
+                try:
+                    choices = event.get("choices")
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                except (AttributeError, IndexError, TypeError) as exc:
+                    raise ModelError("model API returned an invalid stream event") from exc
+                if not isinstance(delta, Mapping):
+                    raise ModelError("stream delta must be an object")
+                text = delta.get("content")
+                if isinstance(text, str) and text:
+                    chunks.append(text)
+                    if on_delta is not None:
+                        on_delta(text)
+                _accumulate_tool_calls(calls, delta.get("tool_calls"))
+
+        self._open_with_retries(payload, consume)
+        if usage is not None and on_usage is not None:
+            on_usage(usage)
+        if calls:
+            actions = [
+                _tool_call_action(calls[index])["action"]
+                for index in sorted(calls)
+            ]
+            if len(actions) == 1:
+                return {"action": actions[0]}
+            # Several independent calls are still one model step; the runtime
+            # executes them in order so no requested work is silently dropped.
+            return {"actions": actions}
+        text = "".join(chunks)
+        if not text.strip():
+            raise ModelProtocolError(
+                "model returned neither a tool call nor text content",
+                raw="",
+            )
+        return parse_json_object(text)
+
+    @staticmethod
+    def _iter_stream_events(response: Any) -> Any:
+        for raw_line in response:
+            check_cancelled()
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or line.startswith(":") or not line.startswith("data:"):
+                continue
+            data_text = line.removeprefix("data:").strip()
+            if data_text == "[DONE]":
+                return
+            try:
+                yield json.loads(data_text)
+            except json.JSONDecodeError as exc:
+                raise ModelError("model API returned an invalid stream event") from exc
+
     def _make_payload(
-        self, messages: Sequence[Mapping[str, str]], *, stream: bool
+        self,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        stream: bool,
+        tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> bytes:
         body: dict[str, Any] = {
             "model": self.model,
@@ -229,6 +343,9 @@ class ChatCompletionsLLM(LLM):
         if stream:
             body["stream"] = True
             body["stream_options"] = {"include_usage": True}
+        if tools is not None:
+            body["tools"] = [_tool_spec(tool) for tool in tools]
+            body["tool_choice"] = "auto"
         return json.dumps(body).encode("utf-8")
 
     def _send(self, payload: bytes) -> bytes:
@@ -340,8 +457,94 @@ class ChatCompletionsLLM(LLM):
         return min(2**attempt, 60.0)
 
 
+def _tool_spec(tool: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert a registered tool description into an OpenAI tool definition."""
+
+    function: dict[str, Any] = {"name": tool["name"]}
+    if tool.get("description"):
+        function["description"] = tool["description"]
+    function["parameters"] = tool.get("args") or {"type": "object"}
+    return {"type": "function", "function": function}
+
+
+def _accumulate_tool_calls(
+    calls: dict[int, dict[str, str]], deltas: Any
+) -> None:
+    """Merge streamed tool-call fragments; providers split names and arguments."""
+
+    if not deltas:
+        return
+    if not isinstance(deltas, Sequence) or isinstance(deltas, (str, bytes)):
+        raise ModelError("stream tool_calls must be a list")
+    for position, delta in enumerate(deltas):
+        if not isinstance(delta, Mapping):
+            raise ModelError("stream tool call must be an object")
+        index = delta.get("index", position)
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise ModelError("stream tool call index must be an integer")
+        function = delta.get("function") or {}
+        if not isinstance(function, Mapping):
+            raise ModelError("stream tool call function must be an object")
+        call = calls.setdefault(index, {"name": "", "arguments": ""})
+        name = function.get("name")
+        if isinstance(name, str):
+            call["name"] += name
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            call["arguments"] += arguments
+
+
+def _tool_call_action(call: Mapping[str, str]) -> dict[str, Any]:
+    """Turn one accumulated tool call into the runtime's action protocol."""
+
+    name = call.get("name", "").strip()
+    if not name:
+        raise ModelProtocolError(
+            "model tool call is missing a function name",
+            raw=_describe_tool_calls({0: call}),
+        )
+    raw_arguments = call.get("arguments", "")
+    if not raw_arguments.strip():
+        arguments: Any = {}
+    else:
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            raise ModelProtocolError(
+                f"model tool call arguments for {name!r} are not valid JSON",
+                raw=raw_arguments,
+            ) from None
+    if not isinstance(arguments, dict):
+        raise ModelProtocolError(
+            f"model tool call arguments for {name!r} must be an object",
+            raw=raw_arguments,
+        )
+    return {"action": {"tool": name, "args": arguments}}
+
+
+def _describe_tool_calls(calls: Mapping[int, Mapping[str, str]]) -> str:
+    """Render accumulated tool calls so the model can see what it produced."""
+
+    return json.dumps(
+        [
+            {
+                "tool": call.get("name", ""),
+                "args": call.get("arguments", ""),
+            }
+            for call in (calls[index] for index in sorted(calls))
+        ],
+        ensure_ascii=False,
+    )
+
+
 def parse_json_object(content: str) -> Mapping[str, Any]:
-    """Parse a JSON object, tolerating a single Markdown JSON code fence."""
+    """Parse exactly one action-protocol JSON object from a model response.
+
+    A response containing more than one protocol object is rejected instead of
+    guessed at: prose examples and multiple candidate steps are
+    indistinguishable, and executing the wrong one is worse than asking the
+    model to retry.
+    """
 
     text = content.strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL)
@@ -349,11 +552,47 @@ def parse_json_object(content: str) -> Mapping[str, Any]:
         text = fenced.group(1)
     try:
         value = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ModelProtocolError("model did not return valid JSON") from exc
+    except json.JSONDecodeError:
+        candidates = _protocol_objects(text)
+        if not candidates:
+            raise ModelProtocolError(
+                "model did not return valid JSON", raw=text
+            ) from None
+        if len(candidates) > 1:
+            raise ModelProtocolError(
+                "model response contains multiple JSON action objects",
+                raw=text,
+            ) from None
+        value = candidates[0]
     if not isinstance(value, dict):
-        raise ModelProtocolError("model response JSON must be an object")
+        raise ModelProtocolError(
+            "model response JSON must be an object", raw=text
+        )
     return value
+
+
+def _protocol_objects(text: str) -> list[dict[str, Any]]:
+    """Return every top-level object carrying ``action`` or ``final_answer``.
+
+    Only top-level objects qualify: a decoded object is skipped whole, so
+    nested fragments and non-protocol objects are never counted as steps.
+    """
+
+    decoder = json.JSONDecoder()
+    found: list[dict[str, Any]] = []
+    index = text.find("{")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            index = text.find("{", index + 1)
+            continue
+        if isinstance(value, dict) and (
+            "action" in value or "final_answer" in value
+        ):
+            found.append(value)
+        index = text.find("{", end)
+    return found
 
 
 def _non_negative_int(value: Any) -> int:

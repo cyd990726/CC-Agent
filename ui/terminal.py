@@ -7,6 +7,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -88,6 +89,38 @@ COMMANDS = (
     ("/verbose", "展开或折叠工具输出"),
     ("/exit", "退出程序"),
 )
+
+
+def format_relative_time(value: str, *, now: datetime | None = None) -> str:
+    """Render a stored ISO-8601 timestamp as a compact relative label."""
+
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        timestamp = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return "未知"
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    timestamp = timestamp.astimezone()
+    current = (now or datetime.now(timezone.utc)).astimezone()
+    seconds = max(0, int((current - timestamp).total_seconds()))
+    if seconds < 60:
+        return "刚刚"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} 分钟前"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} 小时前"
+    elapsed_days = seconds // 86400
+    calendar_days = (current.date() - timestamp.date()).days
+    if calendar_days == 1:
+        return "昨天"
+    if elapsed_days < 7:
+        return f"{elapsed_days} 天前"
+    return timestamp.strftime("%Y-%m-%d")
 
 
 @dataclass
@@ -1293,7 +1326,7 @@ class TerminalApp:
             marker = "*" if self.session is not None and item.id == self.session.id else ""
             table.add_row(
                 item.id + marker,
-                item.updated_at,
+                format_relative_time(item.updated_at),
                 str(len(item.tasks)),
                 item.title,
             )
@@ -2038,7 +2071,11 @@ class TerminalApp:
                         "class:overlay.selected" if active else "class:overlay.option",
                         f"{session.id}{marker}  ",
                     ),
-                    ("class:overlay.meta", f"{len(session.tasks)} tasks  "),
+                    (
+                        "class:overlay.meta",
+                        f"{format_relative_time(session.updated_at)} · "
+                        f"{len(session.tasks)} tasks  ",
+                    ),
                     ("class:overlay.option", f"{title}\n"),
                 ]
             )

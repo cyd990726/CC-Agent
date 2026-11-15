@@ -156,7 +156,6 @@ class TerminalRenderer:
         self._answer_block_id: str | None = None
         self._visible_answer_text = ""
         self._streamed_answer = False
-        self._has_answer_stream = False
         self._answer_blocks_written = 0
         self._run_started_at: float | None = None
         self._tool_started_at: float | None = None
@@ -250,7 +249,6 @@ class TerminalRenderer:
             self._answer_text = ""
             self._visible_answer_text = ""
             self._streamed_answer = False
-            self._has_answer_stream = False
             self._answer_blocks_written = 0
             step = event.data.get("step", 1)
             self._start_status(f"Thinking · step {step}")
@@ -382,9 +380,9 @@ class TerminalRenderer:
     def _render_answer_text_delta(self, text: str, *, block_id: str) -> None:
         if not text:
             return
+        first_delta = not self._answer_text
         self._answer_text += text
-        if not self._has_answer_stream:
-            self._has_answer_stream = True
+        if first_delta:
             self._stop_status()
             self._finish_exploration()
             self._start_status("Responding")
@@ -415,7 +413,7 @@ class TerminalRenderer:
     ) -> None:
         self._stop_status()
         renderables: list[Any] = []
-        if self._stream_render_handler is not None and self._has_answer_stream:
+        if self._stream_render_handler is not None and self._streamed_answer:
             self._publish_streaming_preview(answer, final=True)
         elif self._streamed_answer:
             committed = len(self._visible_answer_text)
@@ -514,7 +512,7 @@ class TerminalRenderer:
         self._answer_blocks_written = 1
 
     def _finish_streaming_preview(self) -> None:
-        if self._stream_render_handler is not None and self._answer_text.strip():
+        if self._stream_render_handler is not None and self._streamed_answer:
             self._publish_streaming_preview(self._answer_text, final=True)
 
     @staticmethod
